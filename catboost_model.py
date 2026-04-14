@@ -1,8 +1,43 @@
 """
 catboost_model.py
 
-CatBoost + Feature Engineering для прогнозирования временных рядов.
-Реализована защита от дубликатов при сохранении результатов.
+CatBoost-прогнозирование показателей надёжности ЖД.
+
+Архитектура
+-----------
+• Входные данные — плоский DataFrame формата generate_monthly_data:
+  ROAD_NAME, YEAR, MONTH + все показатели.
+
+• Категориальные признаки (передаются CatBoost через cat_features):
+    ROAD_NAME  — название дороги
+    YEAR       — год
+    MONTH      — номер месяца
+
+• Целевые переменные (для каждой обучается отдельная модель):
+    TRAIN_KM, LOSS_12_COUNT, LOSS_12_SUM,
+    LOSS_3_COUNT, LOSS_3_SUM, LOSS_TECH_COUNT, LOSS_TECH_SUM
+
+• Производные показатели (вычисляются из прогнозов, не прогнозируются):
+    LOSS_COUNT_TOTAL = LOSS_12_COUNT + LOSS_3_COUNT + LOSS_TECH_COUNT
+    LOSS_SUM_TOTAL   = LOSS_12_SUM   + LOSS_3_SUM   + LOSS_TECH_SUM
+    SPECIFIC_LOSS    = LOSS_SUM_TOTAL / TRAIN_KM * 1 000 000
+
+• Глобальная модель: обучается на всех дорогах сразу — ROAD_NAME
+  как категориальный признак даёт перенос знаний между дорогами.
+
+• Рекурсивный прогноз: для каждого будущего месяца лаги вычисляются
+  по уже предсказанным значениям предыдущих шагов.
+
+Использование
+-------------
+    from catboost_model import run_catboost_forecast
+    from generation_config import ANNUAL_DATA_PATH, ANNUAL_YEAR, ...
+
+    monthly_df = generate_monthly_data(...)
+    forecast_df = run_catboost_forecast(
+        monthly_df=monthly_df,
+        forecast_years=[2025, 2026],
+    )
 """
 
 from __future__ import annotations
@@ -11,327 +46,393 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional
-from catboost import CatBoostRegressor
-from plotting import plot_catboost_forecast
+
+from catboost import CatBoostRegressor, Pool
 
 
-# ======================================================
-# Метрики
-# ======================================================
+# ============================================================
+# КОНСТАНТЫ
+# ============================================================
 
-def mape_percent(y_true, y_pred, eps=1e-9) -> float:
+TARGET_INDICATORS: List[str] = [
+    "TRAIN_KM",
+    "LOSS_12_COUNT", "LOSS_12_SUM",
+    "LOSS_3_COUNT",  "LOSS_3_SUM",
+    "LOSS_TECH_COUNT", "LOSS_TECH_SUM",
+]
+
+# Производные показатели — вычисляются из прогнозов, не прогнозируются отдельно
+DERIVED_INDICATORS: List[str] = [
+    "LOSS_COUNT_TOTAL", "LOSS_SUM_TOTAL", "SPECIFIC_LOSS",
+]
+
+# Все показатели для визуализации (прямые + производные)
+ALL_PLOT_INDICATORS: List[str] = TARGET_INDICATORS + DERIVED_INDICATORS
+
+# Ширина доверительного интервала (доля от прогноза): ±5 %
+CI_HALF_WIDTH: float = 0.05
+
+# Категориальные признаки (передаются CatBoost через cat_features)
+CAT_FEATURES: List[str] = ["ROAD_NAME", "YEAR", "MONTH"]
+
+# Счётчики — после прогноза округляются до целых
+COUNT_COLS: List[str] = [
+    "LOSS_12_COUNT", "LOSS_3_COUNT", "LOSS_TECH_COUNT", "LOSS_COUNT_TOTAL",
+]
+
+LAGS: List[int] = [1, 2, 3, 6, 12]
+ROLLING_WINDOWS: List[int] = [3, 6, 12]
+
+# Параметры CatBoost по умолчанию (см. статьи по настройке)
+DEFAULT_CB_PARAMS: dict = {
+    "loss_function":      "RMSE",
+    "iterations":         2000,
+    "learning_rate":      0.03,
+    "depth":              6,
+    "l2_leaf_reg":        3.0,
+    "random_strength":    1.0,
+    "bagging_temperature": 1.0,
+    "use_best_model":     True,
+    "early_stopping_rounds": 50,
+    "verbose":            False,
+}
+
+
+# ============================================================
+# ПРОИЗВОДНЫЕ ПОКАЗАТЕЛИ
+# ============================================================
+
+def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
+    """Вычисляет LOSS_COUNT_TOTAL, LOSS_SUM_TOTAL, SPECIFIC_LOSS из прогнозов."""
+    df = df.copy()
+    df["LOSS_COUNT_TOTAL"] = (
+        df["LOSS_12_COUNT"] + df["LOSS_3_COUNT"] + df["LOSS_TECH_COUNT"]
+    )
+    df["LOSS_SUM_TOTAL"] = (
+        df["LOSS_12_SUM"] + df["LOSS_3_SUM"] + df["LOSS_TECH_SUM"]
+    )
+    safe_km = df["TRAIN_KM"].replace(0, np.nan)
+    df["SPECIFIC_LOSS"] = df["LOSS_SUM_TOTAL"] / safe_km * 1_000_000
+    return df
+
+
+# ============================================================
+# МЕТРИКИ
+# ============================================================
+
+def mape_percent(y_true, y_pred, eps: float = 1e-9) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     denom = np.maximum(np.abs(y_true), eps)
     return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
 
 
-def smape_percent(y_true, y_pred, eps=1e-9) -> float:
+def smape_percent(y_true, y_pred, eps: float = 1e-9) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     denom = np.maximum((np.abs(y_true) + np.abs(y_pred)) / 2.0, eps)
     return float(np.mean(np.abs(y_true - y_pred) / denom) * 100.0)
 
 
-def aic_proxy(residuals: np.ndarray, n_features: int) -> float:
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
+
+def _add_features(
+    df: pd.DataFrame,
+    target_col: str,
+    lags: List[int],
+    windows: List[int],
+) -> pd.DataFrame:
     """
-    Квази-AIC для ML-моделей (proxy).
-    Используется только для анализа сложности.
+    Добавляет к df временны́е признаки для target_col.
+
+    Признаки строятся внутри каждой дороги (groupby ROAD_NAME) — гарантирует
+    отсутствие утечки между дорогами.
+
+    Признаки:
+        month_sin / month_cos — циклическое кодирование сезонности
+        t                     — линейный индекс времени (тренд)
+        lag_{k}               — значение за k месяцев назад
+        roll_mean_{w}         — скользящее среднее за w месяцев (сдвиг 1)
+        roll_std_{w}          — скользящее СКО за w месяцев (сдвиг 1)
+        diff_1 / diff_12      — разности 1-го и 12-го порядка
     """
-    residuals = np.asarray(residuals, dtype=float)
-    n = len(residuals)
-    if n == 0:
-        return np.nan
-    sigma2 = np.mean(residuals ** 2)
-    return float(n * np.log(sigma2 + 1e-9) + 2 * n_features)
+    df = df.sort_values(["ROAD_NAME", "YEAR", "MONTH"]).reset_index(drop=True)
 
+    # Циклическое кодирование месяца
+    df["month_sin"] = np.sin(2 * np.pi * df["MONTH"] / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["MONTH"] / 12)
 
-# ======================================================
-# Feature Engineering
-# ======================================================
+    # Линейный тренд (порядковый номер месяца внутри дороги)
+    df["t"] = df.groupby("ROAD_NAME").cumcount()
 
-def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
-    m = df["date"].dt.month
-    df["month"] = m
-    df["month_sin"] = np.sin(2 * np.pi * m / 12)
-    df["month_cos"] = np.cos(2 * np.pi * m / 12)
-    df["year"] = df["date"].dt.year
+    # Признаки строятся отдельно для каждой дороги
+    for road, gdf in df.groupby("ROAD_NAME", sort=False):
+        idx = gdf.index
+        vals = gdf[target_col]
+
+        # Лаги
+        for lag in lags:
+            df.loc[idx, f"lag_{lag}"] = vals.shift(lag).values
+
+        # Скользящие статистики по предыдущим значениям (shift=1, нет утечки)
+        shifted = vals.shift(1)
+        for w in windows:
+            df.loc[idx, f"roll_mean_{w}"] = (
+                shifted.rolling(w, min_periods=1).mean().values
+            )
+            df.loc[idx, f"roll_std_{w}"] = (
+                shifted.rolling(w, min_periods=1).std(ddof=0).fillna(0).values
+            )
+
+        # Разности
+        df.loc[idx, "diff_1"]  = vals.diff(1).values
+        df.loc[idx, "diff_12"] = vals.diff(12).values
+
     return df
 
 
-def make_supervised_frame(
-    y: pd.Series,
-    lags: List[int],
-    rolling_windows: List[int],
-    exog: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
-
-    df = pd.DataFrame({"date": y.index, "y": y.values})
-    df = add_calendar_features(df)
-
-    for l in lags:
-        df[f"lag_{l}"] = df["y"].shift(l)
-
-    df["diff_1"] = df["y"].diff(1)
-    df["diff_12"] = df["y"].diff(12)
-
-    for w in rolling_windows:
-        df[f"roll_mean_{w}"] = df["y"].shift(1).rolling(w).mean()
-        df[f"roll_std_{w}"] = df["y"].shift(1).rolling(w).std(ddof=0)
-
-    if exog is not None:
-        ex = exog.loc[y.index]
-        for c in ex.columns:
-            df[f"exog_{c}"] = ex[c].values
-
-    return df.dropna().reset_index(drop=True)
+def _feature_cols(lags: List[int], windows: List[int]) -> List[str]:
+    """Возвращает упорядоченный список признаков (без целевой переменной)."""
+    cols = list(CAT_FEATURES)                        # ROAD_NAME, YEAR, MONTH
+    cols += ["month_sin", "month_cos", "t"]          # сезонность + тренд
+    cols += [f"lag_{l}"       for l in lags]         # лаги
+    cols += [f"roll_mean_{w}" for w in windows]      # скользящие средние
+    cols += [f"roll_std_{w}"  for w in windows]      # скользящие СКО
+    cols += ["diff_1", "diff_12"]                    # разности
+    return cols
 
 
-# ======================================================
-# Рекурсивный прогноз
-# ======================================================
+# ============================================================
+# РЕКУРСИВНЫЙ ПРОГНОЗ
+# ============================================================
 
-def recursive_forecast(
+def _recursive_forecast(
     model: CatBoostRegressor,
-    y_history: pd.Series,
-    future_idx: pd.DatetimeIndex,
+    history_df: pd.DataFrame,
+    target_col: str,
+    forecast_years: List[int],
     lags: List[int],
-    rolling_windows: List[int],
-    exog_future: Optional[pd.DataFrame],
+    windows: List[int],
     feature_cols: List[str],
-) -> pd.Series:
+) -> pd.DataFrame:
+    """
+    Рекурсивный прогноз для всех дорог на forecast_years.
 
-    history = y_history.copy()
-    preds = []
+    На каждом шаге (year, month):
+      1. Строки с NaN-target добавляются к растущей истории.
+      2. _add_features пересчитывает лаги с учётом уже предсказанных значений.
+      3. Прогнозы записываются обратно в историю для следующего шага.
 
-    for d in future_idx:
-        row = pd.DataFrame({"date": [d]})
-        row = add_calendar_features(row)
+    Возвращает DataFrame: ROAD_NAME, YEAR, MONTH, target_col
+    """
+    roads = history_df["ROAD_NAME"].unique()
+    work = history_df[["ROAD_NAME", "YEAR", "MONTH", target_col]].copy()
+    results: List[pd.DataFrame] = []
 
-        for l in lags:
-            row[f"lag_{l}"] = history.iloc[-l]
+    for year in sorted(forecast_years):
+        for month in range(1, 13):
+            # Строки прогноза: все дороги, один месяц
+            future = pd.DataFrame({
+                "ROAD_NAME": roads,
+                "YEAR":      year,
+                "MONTH":     month,
+                target_col:  np.nan,
+            })
 
-        row["diff_1"] = history.iloc[-1] - history.iloc[-2]
-        row["diff_12"] = history.iloc[-1] - history.iloc[-12] if len(history) >= 12 else 0.0
+            # Объединяем историю + будущую строку, строим признаки
+            combined = pd.concat([work, future], ignore_index=True)
+            combined = _add_features(combined, target_col, lags, windows)
 
-        for w in rolling_windows:
-            win = history.iloc[-w:]
-            row[f"roll_mean_{w}"] = win.mean()
-            row[f"roll_std_{w}"] = win.std(ddof=0)
+            # Отбираем строки прогноза по NaN-target
+            pred_mask = combined[target_col].isna()
+            X_pred = combined.loc[pred_mask, feature_cols]
 
-        if exog_future is not None:
-            for c in exog_future.columns:
-                row[f"exog_{c}"] = exog_future.loc[d, c]
+            # Тип ROAD_NAME должен быть строкой для CatBoost
+            X_pred = X_pred.copy()
+            X_pred["ROAD_NAME"] = X_pred["ROAD_NAME"].astype(str)
 
-        X = row[feature_cols]
-        y_hat = float(model.predict(X)[0])
-        preds.append(y_hat)
+            # NaN в лаговых признаках (начало истории) → 0
+            X_pred = X_pred.fillna(0)
 
-        history = pd.concat([history, pd.Series([y_hat], index=[d])])
+            preds = np.maximum(model.predict(X_pred), 0.0)
 
-    return pd.Series(preds, index=future_idx)
+            # Записываем прогнозы
+            future[target_col] = preds
+            work = pd.concat(
+                [work, future[["ROAD_NAME", "YEAR", "MONTH", target_col]]],
+                ignore_index=True,
+            )
+            results.append(future)
+
+    return pd.concat(results, ignore_index=True)
 
 
-# ======================================================
-# Основная функция CatBoost
-# ======================================================
+# ============================================================
+# ОСНОВНАЯ ФУНКЦИЯ
+# ============================================================
 
 def run_catboost_forecast(
-    data_bundle: Dict[str, pd.DataFrame],
-    indicator: str,
-    roads: List[str],
-    horizon: int = 12,
+    monthly_df: pd.DataFrame,
+    forecast_years: List[int],
     outdir: str = "catboost_results",
-    lags: List[int] = [1, 2, 3, 6, 12, 18, 24, 36],
-    rolling_windows: List[int] = [3, 6, 12, 24],
-    exog_indicators: Optional[List[str]] = None,
-    use_prediction_intervals: bool = True,
+    lags: List[int] = None,
+    rolling_windows: List[int] = None,
+    test_year: Optional[int] = None,
     random_seed: int = 42,
-):
+    catboost_params: Optional[dict] = None,
+) -> pd.DataFrame:
+    """
+    Прогнозирование всех целевых показателей для всех дорог.
+
+    Параметры
+    ----------
+    monthly_df      : DataFrame из generate_monthly_data
+    forecast_years  : список лет прогноза, напр. [2025, 2026]
+    outdir          : директория для CSV и метрик
+    lags            : список лагов (по умолчанию LAGS)
+    rolling_windows : размеры окон (по умолчанию ROLLING_WINDOWS)
+    test_year       : год тестирования (по умолчанию max(YEAR))
+    random_seed     : зерно воспроизводимости
+    catboost_params : переопределение параметров CatBoost
+
+    Возвращает
+    ----------
+    pd.DataFrame с прогнозами в формате:
+        ROAD_NAME, YEAR, MONTH, TRAIN_KM, LOSS_12_COUNT, LOSS_12_SUM,
+        LOSS_3_COUNT, LOSS_3_SUM, LOSS_TECH_COUNT, LOSS_TECH_SUM,
+        LOSS_COUNT_TOTAL, LOSS_SUM_TOTAL, SPECIFIC_LOSS
+
+    Доверительные интервалы (±5 % от прогноза) рассчитываются при
+    визуализации в plotting.plot_predictions — отдельных моделей не требуется.
+    """
+    lags = lags or LAGS
+    rolling_windows = rolling_windows or ROLLING_WINDOWS
+
+    params = {**DEFAULT_CB_PARAMS, "random_seed": random_seed}
+    if catboost_params:
+        params.update(catboost_params)
 
     base_out = Path(outdir)
     base_out.mkdir(parents=True, exist_ok=True)
 
-    outdir = base_out / indicator
-    outdir.mkdir(parents=True, exist_ok=True)
+    if test_year is None:
+        test_year = int(monthly_df["YEAR"].max())
 
-    data = data_bundle[indicator]
+    # Убеждаемся, что ROAD_NAME — строка (CatBoost требует str для cat)
+    monthly_df = monthly_df.copy()
+    monthly_df["ROAD_NAME"] = monthly_df["ROAD_NAME"].astype(str)
 
-    future_idx = pd.date_range(
-        data.index[-1] + pd.offsets.MonthBegin(1),
-        periods=horizon,
-        freq="MS",
-    )
+    feat_cols = _feature_cols(lags, rolling_windows)
 
-    forecasts_local = []
-    metrics_local = []
+    forecast_parts: Dict[str, pd.DataFrame] = {}   # target → прогнозный DataFrame
+    metrics_rows: List[dict] = []
 
-    for road in roads:
-        y = data[road]
+    for target in TARGET_INDICATORS:
+        print(f"  [{target}] обучение модели...")
 
-        # -----------------------------
-        # Экзогенные признаки
-        # -----------------------------
-        exog_df = exog_future = None
-        if exog_indicators:
-            exog_df = pd.DataFrame({
-                name: data_bundle[name][road]
-                for name in exog_indicators
+        # ── Признаки на полных данных ──────────────────────
+        full_feat = _add_features(monthly_df, target, lags, rolling_windows)
+
+        train_feat = full_feat[full_feat["YEAR"] <  test_year].dropna(subset=feat_cols + [target])
+        test_feat  = full_feat[full_feat["YEAR"] == test_year].fillna(0)
+
+        X_train = train_feat[feat_cols]
+        y_train = train_feat[target].values
+
+        X_test  = test_feat[feat_cols]
+        y_test  = test_feat[target].values
+
+        # ── CatBoost Pool (категориальные признаки по имени) ──
+        cb_cat = [c for c in CAT_FEATURES if c in feat_cols]
+
+        train_pool = Pool(X_train, label=y_train, cat_features=cb_cat)
+        eval_pool  = Pool(X_test,  label=y_test,  cat_features=cb_cat)
+
+        # ── Основная модель ────────────────────────────────
+        model = CatBoostRegressor(**params)
+        model.fit(train_pool, eval_set=eval_pool)
+
+        # ── Метрики на тесте ───────────────────────────────
+        pred_test = np.maximum(model.predict(eval_pool), 0.0)
+
+        for road in monthly_df["ROAD_NAME"].unique():
+            mask = test_feat["ROAD_NAME"] == road
+            if mask.sum() == 0:
+                continue
+            metrics_rows.append({
+                "indicator":  target,
+                "road":       road,
+                "MAPE_%":     mape_percent(y_test[mask.values], pred_test[mask.values]),
+                "SMAPE_%":    smape_percent(y_test[mask.values], pred_test[mask.values]),
+                "n_trees":    model.tree_count_,
+                "test_year":  test_year,
             })
-            exog_future = pd.DataFrame(
-                {c: exog_df[c].iloc[-1] for c in exog_df.columns},
-                index=future_idx,
-            )
 
-        # -----------------------------
-        # Train / test
-        # -----------------------------
-        y_train = y.iloc[:-horizon]
-        y_test = y.iloc[-horizon:]
-        ex_train = exog_df.loc[y_train.index] if exog_df is not None else None
-
-        train_df = make_supervised_frame(
-            y=y_train,
+        # ── Рекурсивный прогноз ────────────────────────────
+        forecast_part = _recursive_forecast(
+            model=model,
+            history_df=monthly_df[["ROAD_NAME", "YEAR", "MONTH", target]],
+            target_col=target,
+            forecast_years=forecast_years,
             lags=lags,
-            rolling_windows=rolling_windows,
-            exog=ex_train,
+            windows=rolling_windows,
+            feature_cols=feat_cols,
         )
+        forecast_parts[target] = forecast_part.set_index(
+            ["ROAD_NAME", "YEAR", "MONTH"]
+        )[target]
 
-        X_train = train_df.drop(columns=["date", "y"])
-        y_train_target = train_df["y"].values
-        feature_cols = list(X_train.columns)
+        print(f"  [{target}] готово. Деревьев: {model.tree_count_}")
 
-        # -----------------------------
-        # Основная модель
-        # -----------------------------
-        model = CatBoostRegressor(
-            loss_function="MAE",
-            iterations=3000,
-            learning_rate=0.03,
-            depth=8,
-            random_seed=random_seed,
-            verbose=False,
-        )
-        model.fit(X_train, y_train_target)
-
-        # -----------------------------
-        # Квантильные модели
-        # -----------------------------
-        q_low = q_high = None
-        if use_prediction_intervals:
-            q_low = CatBoostRegressor(
-                loss_function="Quantile:alpha=0.05",
-                iterations=model.tree_count_,
-                learning_rate=model.learning_rate_,
-                depth=model.get_params()["depth"],
-                random_seed=random_seed,
-                verbose=False,
-            )
-            q_high = CatBoostRegressor(
-                loss_function="Quantile:alpha=0.95",
-                iterations=model.tree_count_,
-                learning_rate=model.learning_rate_,
-                depth=model.get_params()["depth"],
-                random_seed=random_seed,
-                verbose=False,
-            )
-            q_low.fit(X_train, y_train_target)
-            q_high.fit(X_train, y_train_target)
-
-        # -----------------------------
-        # Прогноз (тест)
-        # -----------------------------
-        pred_test = recursive_forecast(
-            model,
-            y_train,
-            y_test.index,
-            lags,
-            rolling_windows,
-            exog_df.loc[y_test.index] if exog_df is not None else None,
-            feature_cols,
-        )
-
-        residuals = y_test.values - pred_test.values
-
-        # -----------------------------
-        # Прогноз (будущее)
-        # -----------------------------
-        pred_future = recursive_forecast(
-            model,
-            y,
-            future_idx,
-            lags,
-            rolling_windows,
-            exog_future,
-            feature_cols,
-        )
-
-        lower_95 = upper_95 = None
-        if q_low is not None and q_high is not None:
-            lower_95 = recursive_forecast(
-                q_low, y, future_idx, lags, rolling_windows, exog_future, feature_cols
-            )
-            upper_95 = recursive_forecast(
-                q_high, y, future_idx, lags, rolling_windows, exog_future, feature_cols
-            )
-
-        plot_catboost_forecast(
-            data=y,
-            future_idx=future_idx,
-            forecast=pred_future,
-            lower=lower_95,
-            upper=upper_95,
-            road=road,
-            indicator=indicator,
-            outpath=outdir / f"forecast_{indicator}_{road}.png",
-        )
-
-        forecasts_df = pd.DataFrame({
-            "indicator": indicator,
-            "road": road,
-            "date": future_idx,
-            "forecast": pred_future.values,
-        })
-
-        if lower_95 is not None:
-            forecasts_df["lower_95"] = lower_95.values
-            forecasts_df["upper_95"] = upper_95.values
-
-        metrics_row = {
-            "indicator": indicator,
-            "road": road,
-            "model_type": "CatBoost",
-            "MAPE_test_%": mape_percent(y_test, pred_test),
-            "SMAPE_test_%": smape_percent(y_test, pred_test),
-            "AIC": aic_proxy(residuals, len(feature_cols)),
-            "resid_std": float(np.std(residuals, ddof=0)),
-            "features_n": len(feature_cols),
-        }
-
-        forecasts_local.append(forecasts_df)
-        metrics_local.append(metrics_row)
-
-    # ==================================================
-    # УДАЛЕНИЕ ДУБЛИКАТОВ ПЕРЕД СОХРАНЕНИЕМ
-    # ==================================================
-
-    forecasts_df = pd.concat(forecasts_local, ignore_index=True)
-    forecasts_df = forecasts_df.drop_duplicates(
-        subset=["indicator", "road", "date"]
+    # ── Сборка итогового DataFrame ─────────────────────────
+    idx = pd.MultiIndex.from_product(
+        [sorted(monthly_df["ROAD_NAME"].unique()), forecast_years, range(1, 13)],
+        names=["ROAD_NAME", "YEAR", "MONTH"],
     )
+    out = pd.DataFrame(index=idx)
 
-    metrics_df = pd.DataFrame(metrics_local)
-    metrics_df = metrics_df.drop_duplicates(
-        subset=["indicator", "road", "model_type"]
-    )
+    for target in TARGET_INDICATORS:
+        out[target] = forecast_parts[target]
 
-    # -----------------------------
-    # Сохранение
-    # -----------------------------
-    f_path = base_out / "catboost_forecasts_all_indicators.csv"
-    m_path = base_out / "catboost_metrics_all_indicators.csv"
+    out = out.reset_index()
 
-    forecasts_df.to_csv(f_path, mode="a", header=not f_path.exists(), index=False)
-    metrics_df.to_csv(m_path, mode="a", header=not m_path.exists(), index=False)
+    # Неотрицательность
+    for col in TARGET_INDICATORS:
+        out[col] = out[col].clip(lower=0)
 
-    print(f"✅ CatBoost прогноз выполнен для '{indicator}'")
+    # Округление счётчиков
+    for col in [c for c in COUNT_COLS if c in out.columns]:
+        out[col] = out[col].round().astype(int)
+
+    # Производные показатели
+    out = compute_derived(out)
+
+    # Доверительные интервалы ± CI_HALF_WIDTH для всех показателей
+    for col in ALL_PLOT_INDICATORS:
+        if col in out.columns:
+            out[f"{col}_lower_95"] = (out[col] * (1.0 - CI_HALF_WIDTH)).clip(lower=0)
+            out[f"{col}_upper_95"] =  out[col] * (1.0 + CI_HALF_WIDTH)
+
+    # Порядок столбцов: сначала значения, затем CI-пары рядом с каждым показателем
+    id_cols = ["ROAD_NAME", "YEAR", "MONTH"]
+    value_ci_cols = []
+    for col in ALL_PLOT_INDICATORS:
+        value_ci_cols.append(col)
+        value_ci_cols.append(f"{col}_lower_95")
+        value_ci_cols.append(f"{col}_upper_95")
+    out = out[id_cols + value_ci_cols].sort_values(["ROAD_NAME", "YEAR", "MONTH"]).reset_index(drop=True)
+
+    # ── Сохранение ─────────────────────────────────────────
+    forecast_path = base_out / "catboost_forecasts.csv"
+    metrics_path  = base_out / "catboost_metrics.csv"
+
+    out.to_csv(forecast_path, index=False, encoding="utf-8-sig")
+    pd.DataFrame(metrics_rows).to_csv(metrics_path, index=False, encoding="utf-8-sig")
+
+    print(f"\n✅ Прогнозы сохранены: {forecast_path}")
+    print(f"✅ Метрики сохранены:   {metrics_path}")
+    print(f"   Строк в прогнозе:   {len(out)}")
+
+    return out

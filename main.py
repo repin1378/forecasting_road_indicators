@@ -1,88 +1,124 @@
 """
-ETS(A,A,A) — прогнозирование с доверительными интервалами (95%)
+Прогнозирование показателей надёжности ЖД с помощью CatBoost.
 
 Шаги:
-1. Генерация синтетических временных рядов (2022–2025)
-2. Обучение ETS(A,A,A)
-3. Прогноз на 12 месяцев 2026 года
-4. Расчёт доверительных интервалов
-5. Сохранение прогнозов, метрик и графиков
+1. Генерация синтетических помесячных данных на основе годовых итогов 2024 года
+2. Обучение CatBoost-моделей (по одной на каждый целевой показатель)
+3. Прогноз на заданные годы
+4. Вычисление производных показателей и доверительных интервалов
+5. Сохранение прогнозов и метрик в CSV
 """
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from pathlib import Path
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from series_generator import generate_all_series
-from generation_config import ROADS, DATES, GEN_PARAMS
-from generation_config import SEED  # если нужно использовать seed явно
-from ets_model import run_ets_forecast
-# from ets_report import generate_ets_pdf_report
 import warnings
+from pathlib import Path
+
+import pandas as pd
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
-from sanity_check import sanity_check_yearly_aggregation_to_csv
-from catboost_model import run_catboost_forecast
-from smape_comparison import build_smape_comparison
+
+from catboost_model import run_catboost_forecast, ALL_PLOT_INDICATORS
+from generation_config import (
+    ANNUAL_DATA_PATH, ANNUAL_YEAR,
+    START_YEAR, END_YEAR,
+    INDICATOR_CONFIG, SEASONAL_PROFILES,
+    OUTPUT_CSV, SEED,
+)
+from series_generator import generate_monthly_data
+from plotting import plot_predictions
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 
-# --------------------------------------------------
-# 1. Генерация данных
-# --------------------------------------------------
-data_bundle = generate_all_series(
-    gen_params=GEN_PARAMS,
-    start="2018-01-01",
-    end="2025-12-01",
-    allow_spikes=True,
-    num_forced_outliers=3,
-)
+# ==================================================
+# УПРАВЛЕНИЕ ШАГАМИ
+#
+# Установи флаг в False, чтобы пропустить шаг и
+# загрузить готовый результат из CSV-файла.
+# ==================================================
+RUN_GENERATION = False    # Шаг 1: генерация monthly_df
+RUN_FORECAST   = True    # Шаг 2: обучение моделей и прогноз
+RUN_PLOTS      = True    # Шаг 3: построение HTML-графиков
 
-ROADS = ["Окт", "Клнг", "Моск", "Горьк", "Сев", "С-Кав", "Ю-Вост", "Прив", "Кбш", "Сверд", "Ю-Ур", "З-Сиб", "Крас", "В-Сиб", "Заб", "Двост"]
-INDICATORS = [
-    "train_km",
-    "loss_12",
-    "loss_3",
-    "loss_tech",
-    "loss_total",
-    "specific",
-]
+MONTHLY_CSV  = OUTPUT_CSV                                  # synthetic_data/synthetic_monthly.csv
+FORECAST_CSV = Path("catboost_results/catboost_forecasts.csv")
+PLOTS_DIR    = Path("catboost_results/plots")
+
+forecast_years = list(range(END_YEAR + 1, END_YEAR + 3))  # [2025, 2026]
 
 
 # --------------------------------------------------
-# 2. ETS (baseline)
+# 1. Генерация синтетических помесячных данных
+#
+#    Источник: годовые итоги по каждой дороге за 2024 год
+#              (examples/example_year.xlsx)
+#    Результат: monthly_df — 16 дорог × N лет × 12 месяцев
+#               сохраняется в synthetic_data/synthetic_monthly.csv
 # --------------------------------------------------
-for ind in INDICATORS:
-    run_ets_forecast(
-        data_bundle=data_bundle,
-        indicator=ind,
-        roads=ROADS,
-        horizon=12,
-        outdir="ets_results",
+if RUN_GENERATION:
+    monthly_df = generate_monthly_data(
+        annual_data_path=ANNUAL_DATA_PATH,
+        start_year=START_YEAR,               # 2018
+        end_year=END_YEAR,                   # 2024
+        annual_year=ANNUAL_YEAR,             # 2024 — год привязки к реальным данным
+        indicator_config=INDICATOR_CONFIG,
+        seasonal_profiles=SEASONAL_PROFILES,
+        seed=SEED,
+        output_csv=MONTHLY_CSV,
     )
+    print(f"[Шаг 1] Данные сгенерированы: {monthly_df.shape[0]} строк "
+          f"({monthly_df['ROAD_NAME'].nunique()} дорог × "
+          f"{monthly_df['YEAR'].nunique()} лет × 12 месяцев)")
+else:
+    monthly_df = pd.read_csv(MONTHLY_CSV, encoding="utf-8-sig")
+    print(f"[Шаг 1] Пропущен. Загружено из {MONTHLY_CSV}: {monthly_df.shape[0]} строк")
 
 
 # --------------------------------------------------
-# 3. CatBoost (ML)
+# 2. Прогноз CatBoost
 # --------------------------------------------------
-for ind in INDICATORS:
-    run_catboost_forecast(
-        data_bundle=data_bundle,
-        indicator=ind,
-        roads=ROADS,
-        horizon=12,
+if RUN_FORECAST:
+    forecast_df = run_catboost_forecast(
+        monthly_df=monthly_df,
+        forecast_years=forecast_years,
         outdir="catboost_results",
-        exog_indicators=["train_km", "loss_total"] if ind == "specific" else None,
+        lags=[1, 2, 3, 6, 12],
+        rolling_windows=[3, 6, 12],
+        test_year=END_YEAR,                  # 2024 — год оценки качества
+        random_seed=SEED,
     )
+    print(f"[Шаг 2] Прогноз готов: {forecast_df.shape[0]} строк "
+          f"(годы {forecast_years[0]}–{forecast_years[-1]})")
+else:
+    forecast_df = pd.read_csv(FORECAST_CSV, encoding="utf-8-sig")
+    print(f"[Шаг 2] Пропущен. Загружено из {FORECAST_CSV}: {forecast_df.shape[0]} строк")
 
 
-print("✅ ETS и CatBoost рассчитаны. CSV и графики сохранены.")
+# --------------------------------------------------
+# 3. Визуализация — интерактивные HTML-графики
+#
+#    Для каждой дороги и каждого целевого показателя
+#    строится отдельный HTML-файл с:
+#      - историческими данными (серая линия)
+#      - прогнозом CatBoost (синяя пунктирная линия)
+#      - доверительным интервалом 95 % (синяя заливка)
+#      - вертикальной границей история / прогноз
+# --------------------------------------------------
+if RUN_PLOTS:
+    roads = monthly_df["ROAD_NAME"].unique()
+    print(f"\n[Шаг 3] Построение графиков -> {PLOTS_DIR}/")
 
+    for indicator in ALL_PLOT_INDICATORS:
+        for road in roads:
+            road_slug = road.replace(" ", "_").replace("-", "_")
+            outpath = PLOTS_DIR / indicator / f"{road_slug}.html"
+            plot_predictions(
+                monthly_df=monthly_df,
+                forecast_df=forecast_df,
+                indicator=indicator,
+                road=road,
+                outpath=outpath,
+            )
 
-build_smape_comparison(
-    ets_metrics_path="ets_results/ets_metrics_all_indicators.csv",
-    catboost_metrics_path="catboost_results/catboost_metrics_all_indicators.csv",
-    detailed_out="compare_resuls/smape_comparison_detailed.csv",
-    summary_out="compare_resuls/smape_comparison_by_indicator.csv",
-)
+    print(f"[OK] Графики сохранены: {len(ALL_PLOT_INDICATORS)} показателей x "
+          f"{len(roads)} дорог = {len(ALL_PLOT_INDICATORS) * len(roads)} файлов")
+else:
+    print("[Шаг 3] Пропущен.")
