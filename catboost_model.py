@@ -282,20 +282,26 @@ def run_catboost_forecast(
     test_year: Optional[int] = None,
     random_seed: int = 42,
     catboost_params: Optional[dict] = None,
+    catboost_params_per_target: Optional[Dict[str, dict]] = None,
 ) -> pd.DataFrame:
     """
     Прогнозирование всех целевых показателей для всех дорог.
 
     Параметры
     ----------
-    monthly_df      : DataFrame из generate_monthly_data
-    forecast_years  : список лет прогноза, напр. [2025, 2026]
-    outdir          : директория для CSV и метрик
-    lags            : список лагов (по умолчанию LAGS)
-    rolling_windows : размеры окон (по умолчанию ROLLING_WINDOWS)
-    test_year       : год тестирования (по умолчанию max(YEAR))
-    random_seed     : зерно воспроизводимости
-    catboost_params : переопределение параметров CatBoost
+    monthly_df               : DataFrame из generate_monthly_data
+    forecast_years           : список лет прогноза, напр. [2025, 2026]
+    outdir                   : директория для CSV и метрик
+    lags                     : список лагов (по умолчанию LAGS)
+    rolling_windows          : размеры окон (по умолчанию ROLLING_WINDOWS)
+    test_year                : год тестирования (по умолчанию max(YEAR))
+    random_seed              : зерно воспроизводимости
+    catboost_params          : глобальное переопределение параметров CatBoost
+                               (применяется ко всем показателям)
+    catboost_params_per_target : словарь {target: params_dict} с оптимальными
+                               параметрами для каждого показателя отдельно.
+                               Берётся из run_optimization_all() / load_best_params().
+                               Имеет приоритет над catboost_params.
 
     Возвращает
     ----------
@@ -310,9 +316,9 @@ def run_catboost_forecast(
     lags = lags or LAGS
     rolling_windows = rolling_windows or ROLLING_WINDOWS
 
-    params = {**DEFAULT_CB_PARAMS, "random_seed": random_seed}
+    base_params = {**DEFAULT_CB_PARAMS, "random_seed": random_seed}
     if catboost_params:
-        params.update(catboost_params)
+        base_params.update(catboost_params)
 
     base_out = Path(outdir)
     base_out.mkdir(parents=True, exist_ok=True)
@@ -330,6 +336,11 @@ def run_catboost_forecast(
     metrics_rows: List[dict] = []
 
     for target in TARGET_INDICATORS:
+        # Параметры: база → глобальный override → per-target override
+        params = base_params.copy()
+        if catboost_params_per_target and target in catboost_params_per_target:
+            params.update(catboost_params_per_target[target])
+
         print(f"  [{target}] обучение модели...")
 
         # ── Признаки на полных данных ──────────────────────

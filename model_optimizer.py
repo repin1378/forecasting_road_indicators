@@ -496,6 +496,79 @@ def load_best_params(outdir: str | Path, target: str) -> Optional[dict]:
 
 
 # ============================================================
+# ПУБЛИЧНЫЙ АЛИАС — совместимость со стилем mlgu.ru/1004
+# ============================================================
+
+def optimize_model_parameters(
+    train_pool: "Pool",
+    test_pool: "Pool",
+    n_splits: int = 5,
+    seed: int = 42,
+    verbose: bool = True,
+) -> "CatBoostRegressor":
+    """
+    Оптимизация гиперпараметров CatBoost — публичный интерфейс
+    в стиле mlgu.ru/1004.
+
+    В отличие от оригинальной реализации (sklearn GridSearchCV + обычный K-Fold):
+      • используется TimeSeriesSplit — нет утечки данных из будущего,
+      • категориальные признаки передаются через нативный CatBoost Pool,
+      • не требует параметра n_jobs (CatBoost многопоточен внутри).
+
+    Параметры
+    ----------
+    train_pool : CatBoost Pool с обучающими данными
+    test_pool  : CatBoost Pool для ранней остановки
+    n_splits   : число фолдов TimeSeriesSplit
+    seed       : зерно воспроизводимости
+    verbose    : выводить прогресс
+
+    Возвращает
+    ----------
+    Обученный CatBoostRegressor с лучшими параметрами
+
+    Пример
+    ------
+        from catboost import Pool
+        from model_optimizer import optimize_model_parameters
+
+        train_pool = Pool(X_train, y_train, cat_features=cat_cols)
+        test_pool  = Pool(X_test,  y_test,  cat_features=cat_cols)
+
+        model = optimize_model_parameters(train_pool, test_pool)
+    """
+    X = pd.DataFrame(
+        train_pool.get_features(),
+        columns=train_pool.get_feature_names() or [
+            f"f{i}" for i in range(train_pool.num_col())
+        ],
+    )
+    y = np.asarray(train_pool.get_label())
+    cat_cols = list(train_pool.get_cat_feature_indices() or [])
+
+    # Преобразуем числовые индексы кат.признаков в имена столбцов
+    cat_col_names = [X.columns[i] for i in cat_cols] if cat_cols else []
+
+    best_params = optimize_model_parameters_grid(
+        X_train=X,
+        y_train=y,
+        cat_cols=cat_col_names,
+        n_splits=n_splits,
+        seed=seed,
+        verbose=verbose,
+    )
+
+    if verbose:
+        print(f"\n  Лучшие параметры: {best_params}")
+
+    final_params = {**DEFAULT_CB_PARAMS, **best_params, "random_seed": seed, "verbose": False}
+    model = CatBoostRegressor(**final_params)
+    model.fit(train_pool, eval_set=test_pool)
+
+    return model
+
+
+# ============================================================
 # ОСНОВНАЯ ФУНКЦИЯ
 # ============================================================
 

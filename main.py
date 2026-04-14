@@ -15,13 +15,14 @@ from pathlib import Path
 import pandas as pd
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
-from catboost_model import run_catboost_forecast, ALL_PLOT_INDICATORS
+from catboost_model import run_catboost_forecast, ALL_PLOT_INDICATORS, TARGET_INDICATORS
 from generation_config import (
     ANNUAL_DATA_PATH, ANNUAL_YEAR,
     START_YEAR, END_YEAR,
     INDICATOR_CONFIG, SEASONAL_PROFILES,
     OUTPUT_CSV, SEED,
 )
+from model_optimizer import run_optimization_all, load_best_params
 from series_generator import generate_monthly_data
 from plotting import plot_predictions
 
@@ -34,9 +35,14 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 # Установи флаг в False, чтобы пропустить шаг и
 # загрузить готовый результат из CSV-файла.
 # ==================================================
-RUN_GENERATION = False    # Шаг 1: генерация monthly_df
-RUN_FORECAST   = True    # Шаг 2: обучение моделей и прогноз
-RUN_PLOTS      = True    # Шаг 3: построение HTML-графиков
+RUN_GENERATION   = False   # Шаг 1:   генерация monthly_df
+RUN_OPTIMIZATION = False   # Шаг 1.5: оптимизация гиперпараметров CatBoost
+RUN_FORECAST     = True    # Шаг 2:   обучение моделей и прогноз
+RUN_PLOTS        = True    # Шаг 3:   построение HTML-графиков
+
+# Метод оптимизации: "grid" (полный перебор) или "optuna" (байесовский поиск)
+OPTIMIZE_METHOD   = "optuna"
+OPTIMIZE_N_TRIALS = 50      # число испытаний (только для "optuna")
 
 MONTHLY_CSV  = OUTPUT_CSV                                  # synthetic_data/synthetic_monthly.csv
 FORECAST_CSV = Path("catboost_results/catboost_forecasts.csv")
@@ -73,6 +79,41 @@ else:
 
 
 # --------------------------------------------------
+# 1.5. Оптимизация гиперпараметров CatBoost
+#
+#    Результат — словарь {target: best_params_dict} —
+#    передаётся в run_catboost_forecast как
+#    catboost_params_per_target.
+#
+#    Если RUN_OPTIMIZATION=False, модуль пытается
+#    загрузить ранее сохранённые параметры из JSON-кеша
+#    (catboost_results/best_params/<target>.json).
+# --------------------------------------------------
+if RUN_OPTIMIZATION:
+    best_params_per_target = run_optimization_all(
+        monthly_df=monthly_df,
+        method=OPTIMIZE_METHOD,
+        n_trials=OPTIMIZE_N_TRIALS,
+        n_splits=5,
+        outdir="catboost_results",
+        force_refit=True,
+    )
+    print(f"[Шаг 1.5] Оптимизация завершена для {len(best_params_per_target)} показателей")
+else:
+    best_params_per_target = {}
+    for t in TARGET_INDICATORS:
+        cached = load_best_params("catboost_results", t)
+        if cached:
+            best_params_per_target[t] = cached
+
+    if best_params_per_target:
+        print(f"[Шаг 1.5] Пропущен. Загружены кешированные параметры "
+              f"для {len(best_params_per_target)} показателей")
+    else:
+        print("[Шаг 1.5] Пропущен. Используются параметры CatBoost по умолчанию.")
+
+
+# --------------------------------------------------
 # 2. Прогноз CatBoost
 # --------------------------------------------------
 if RUN_FORECAST:
@@ -84,6 +125,7 @@ if RUN_FORECAST:
         rolling_windows=[3, 6, 12],
         test_year=END_YEAR,                  # 2024 — год оценки качества
         random_seed=SEED,
+        catboost_params_per_target=best_params_per_target or None,
     )
     print(f"[Шаг 2] Прогноз готов: {forecast_df.shape[0]} строк "
           f"(годы {forecast_years[0]}–{forecast_years[-1]})")
