@@ -34,9 +34,10 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 
 
 # ============================================================
@@ -104,9 +105,12 @@ def save_training_curves(
 
     evals = model.get_evals_result()
     # evals: {"learn": {"RMSE": [...]}, "validation": {"RMSE": [...]}}
+    # MultiRMSE models log "MultiRMSE" instead of "RMSE" → try both keys
 
-    learn_rmse = evals.get("learn", {}).get("RMSE", [])
-    val_rmse   = evals.get("validation", {}).get("RMSE", [])
+    learn_rmse = (evals.get("learn", {}).get("RMSE", [])
+                  or evals.get("learn", {}).get("MultiRMSE", []))
+    val_rmse   = (evals.get("validation", {}).get("RMSE", [])
+                  or evals.get("validation", {}).get("MultiRMSE", []))
 
     if not learn_rmse:
         print(f"  [!] get_evals_result() пуст — кривые обучения недоступны ({indicator})")
@@ -257,3 +261,150 @@ def save_tree(
             "      Убедитесь, что системный graphviz установлен и доступен в PATH."
         )
         return None
+
+
+# ============================================================
+# SHAP FEATURE IMPORTANCE
+# ============================================================
+
+def save_shap_report(
+    model,
+    X_test,
+    feature_names: List[str],
+    indicator: str,
+    outdir,
+    *,
+    targets: Optional[List[str]] = None,
+) -> Optional[Path]:
+    """
+    Считает SHAP-значения и сохраняет отчёт о значимости факторов как HTML.
+
+    SHAP показывает, насколько каждый признак сдвигает прогноз от среднего
+    для конкретного наблюдения. Это более точная оценка влияния, чем
+    стандартная feature importance (которая усредняет по всем деревьям).
+
+    Параметры
+    ----------
+    model        : обученный CatBoostRegressor (одиночный или MultiRMSE)
+    X_test       : матрица признаков тестовой выборки (DataFrame)
+    feature_names: упорядоченный список имён признаков (без bias-столбца)
+    indicator    : название показателя/группы (для имени файла и заголовка)
+    outdir       : директория для сохранения HTML
+    targets      : список целевых переменных для MultiRMSE-модели;
+                   None → режим одиночного таргета.
+
+    SHAP-массивы
+    ------------
+    Одиночный таргет : shape (n_samples, n_features + 1) — последний столбец bias
+    MultiRMSE        : shape (n_samples, n_targets, n_features + 1)
+
+    Метрика: mean |SHAP| по всем образцам — суммарное влияние каждого признака.
+
+    Возвращает путь к сохранённому HTML или None при ошибке.
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        print(f"  [!] plotly не установлен — SHAP-отчёт не сохранён ({indicator})")
+        return None
+
+    from catboost import Pool as CbPool   # локальный импорт — избегаем цикличности
+
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Определяем категориальные признаки
+    try:
+        from catboost_model import CAT_FEATURES
+        cat_cols = [c for c in CAT_FEATURES if c in feature_names]
+    except ImportError:
+        cat_cols = []
+
+    shap_pool = CbPool(X_test, cat_features=cat_cols)
+    shap_vals = model.get_feature_importance(shap_pool, type="ShapValues")
+    # shap_vals: (n_samples, n_features+1)           — одиночный таргет
+    #         или (n_samples, n_targets, n_features+1) — MultiRMSE
+
+    n_features = len(feature_names)
+
+    def _make_bar(names, values, color, title_suffix=""):
+        """Возвращает горизонтальный bar-trace (от меньшего к большему — снизу вверх)."""
+        order = np.argsort(values)          # ascending → снизу-вверх на горизонтальном баре
+        return go.Bar(
+            x=values[order],
+            y=[names[i] for i in order],
+            orientation="h",
+            name=title_suffix,
+            marker=dict(
+                color=values[order],
+                colorscale="Blues",
+                showscale=False,
+            ),
+            text=[f"{v:.3f}" for v in values[order]],
+            textposition="outside",
+        )
+
+    if shap_vals.ndim == 2:
+        # ── Одиночный таргет ─────────────────────────────────
+        shap_no_bias = shap_vals[:, :n_features]
+        mean_abs = np.abs(shap_no_bias).mean(axis=0)
+
+        fig = go.Figure(_make_bar(feature_names, mean_abs, "#2196F3"))
+        fig.update_layout(
+            title=dict(
+                text=f"<b>SHAP — значимость факторов</b>"
+                     f"<br><sup>{indicator}</sup>",
+                font=dict(size=14), x=0.02, xanchor="left",
+            ),
+            xaxis=dict(title="Mean |SHAP value|", showgrid=True, gridcolor="#e0e0e0"),
+            yaxis=dict(tickfont=dict(size=10)),
+            plot_bgcolor="#f9f9f9",
+            paper_bgcolor="white",
+            margin=dict(l=200, r=80, t=80, b=60),
+            width=900,
+            height=max(400, n_features * 22),
+        )
+
+    else:
+        # ── MultiRMSE: отдельный subplot на каждый таргет ─────
+        n_tgts = shap_vals.shape[1]
+        tgt_labels = targets if targets else [f"target_{i}" for i in range(n_tgts)]
+        colors = ["#2196F3", "#F44336", "#4CAF50", "#FF9800"]
+
+        fig = make_subplots(
+            rows=1, cols=n_tgts,
+            subplot_titles=tgt_labels,
+            shared_yaxes=False,
+        )
+
+        for ti in range(n_tgts):
+            shap_t = shap_vals[:, ti, :n_features]
+            mean_abs = np.abs(shap_t).mean(axis=0)
+            trace = _make_bar(feature_names, mean_abs, colors[ti % len(colors)],
+                              title_suffix=tgt_labels[ti])
+            fig.add_trace(trace, row=1, col=ti + 1)
+            fig.update_yaxes(tickfont=dict(size=9), row=1, col=ti + 1)
+            fig.update_xaxes(
+                title_text="Mean |SHAP|",
+                showgrid=True, gridcolor="#e0e0e0",
+                row=1, col=ti + 1,
+            )
+
+        fig.update_layout(
+            title=dict(
+                text=f"<b>SHAP — значимость факторов</b>"
+                     f"<br><sup>{indicator}: {', '.join(tgt_labels)}</sup>",
+                font=dict(size=14), x=0.02, xanchor="left",
+            ),
+            plot_bgcolor="#f9f9f9",
+            paper_bgcolor="white",
+            showlegend=False,
+            margin=dict(l=200, r=80, t=90, b=60),
+            width=860 * n_tgts,
+            height=max(400, n_features * 22),
+        )
+
+    outpath = outdir / f"{indicator}_shap.html"
+    fig.write_html(str(outpath), include_plotlyjs="cdn")
+    return outpath

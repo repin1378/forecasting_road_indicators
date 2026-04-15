@@ -49,6 +49,7 @@ OPTIMIZE_N_SPLITS = 3       # число фолдов CV: 3 вместо 5  → 
 PLOT_TRAINING  = True    # кривые train/val RMSE → catboost_results/training_curves/
 PLOT_TREE      = True    # структура дерева SVG  → catboost_results/trees/
 PLOT_TREE_IDX  = 0       # индекс дерева для plot_tree (0 = первое дерево)
+PLOT_SHAP      = True    # значимость факторов (SHAP) → catboost_results/shap/
 
 MONTHLY_CSV  = OUTPUT_CSV                                  # synthetic_data/synthetic_monthly.csv
 FORECAST_CSV = Path("catboost_results/catboost_forecasts.csv")
@@ -135,6 +136,7 @@ if RUN_FORECAST:
         plot_training=PLOT_TRAINING,
         plot_tree=PLOT_TREE,
         plot_tree_idx=PLOT_TREE_IDX,
+        plot_shap=PLOT_SHAP,
     )
     print(f"[Шаг 2] Прогноз готов: {forecast_df.shape[0]} строк "
           f"(годы {forecast_years[0]}–{forecast_years[-1]})")

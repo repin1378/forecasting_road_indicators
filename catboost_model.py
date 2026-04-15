@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from catboost import CatBoostRegressor, Pool
-from catboost_viz import save_training_curves, save_tree
+from catboost_viz import save_training_curves, save_tree, save_shap_report
 
 
 # ============================================================
@@ -61,6 +61,18 @@ TARGET_INDICATORS: List[str] = [
     "LOSS_3_COUNT",  "LOSS_3_SUM",
     "LOSS_TECH_COUNT", "LOSS_TECH_SUM",
 ]
+
+# Показатели, обучаемые одиночной моделью (loss_function="RMSE")
+SINGLE_TARGETS: List[str] = ["TRAIN_KM"]
+
+# Группы для совместного обучения (loss_function="MultiRMSE").
+# COUNT и SUM одного типа отказов тесно коррелированы — совместная модель
+# учитывает их взаимосвязь и предотвращает противоречия в прогнозах.
+MULTI_TARGET_GROUPS: Dict[str, List[str]] = {
+    "LOSS_12":   ["LOSS_12_COUNT",   "LOSS_12_SUM"],
+    "LOSS_3":    ["LOSS_3_COUNT",    "LOSS_3_SUM"],
+    "LOSS_TECH": ["LOSS_TECH_COUNT", "LOSS_TECH_SUM"],
+}
 
 # Производные показатели — вычисляются из прогнозов, не прогнозируются отдельно
 DERIVED_INDICATORS: List[str] = [
@@ -206,6 +218,125 @@ def _feature_cols(lags: List[int], windows: List[int]) -> List[str]:
 
 
 # ============================================================
+# FEATURE ENGINEERING — MULTI-TARGET
+# ============================================================
+
+def _add_features_multi(
+    df: pd.DataFrame,
+    targets: List[str],
+    lags: List[int],
+    windows: List[int],
+) -> pd.DataFrame:
+    """
+    Строит матрицу признаков для нескольких целевых переменных одновременно.
+
+    Для каждого таргета создаются признаки с суффиксом _{TARGET}:
+        lag_1_LOSS_12_COUNT, roll_mean_3_LOSS_12_SUM, diff_12_LOSS_12_COUNT …
+
+    Общие структурные признаки (month_sin, month_cos, t) добавляются один раз.
+    В df должны присутствовать все столбцы из targets.
+    """
+    df = df.sort_values(["ROAD_NAME", "YEAR", "MONTH"]).reset_index(drop=True)
+
+    df["month_sin"] = np.sin(2 * np.pi * df["MONTH"] / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["MONTH"] / 12)
+    df["t"] = df.groupby("ROAD_NAME").cumcount()
+
+    for road, gdf in df.groupby("ROAD_NAME", sort=False):
+        idx = gdf.index
+        for target in targets:
+            vals = gdf[target]
+            for lag in lags:
+                df.loc[idx, f"lag_{lag}_{target}"] = vals.shift(lag).values
+            shifted = vals.shift(1)
+            for w in windows:
+                df.loc[idx, f"roll_mean_{w}_{target}"] = (
+                    shifted.rolling(w, min_periods=1).mean().values
+                )
+                df.loc[idx, f"roll_std_{w}_{target}"] = (
+                    shifted.rolling(w, min_periods=1).std(ddof=0).fillna(0).values
+                )
+            df.loc[idx, f"diff_1_{target}"]  = vals.diff(1).values
+            df.loc[idx, f"diff_12_{target}"] = vals.diff(12).values
+
+    return df
+
+
+def _feature_cols_multi(
+    targets: List[str],
+    lags: List[int],
+    windows: List[int],
+) -> List[str]:
+    """Возвращает список признаков для многоцелевой модели."""
+    cols = list(CAT_FEATURES)               # ROAD_NAME, YEAR, MONTH
+    cols += ["month_sin", "month_cos", "t"] # сезонность + тренд
+    for target in targets:
+        cols += [f"lag_{l}_{target}"        for l in lags]
+        cols += [f"roll_mean_{w}_{target}"  for w in windows]
+        cols += [f"roll_std_{w}_{target}"   for w in windows]
+        cols += [f"diff_1_{target}", f"diff_12_{target}"]
+    return cols
+
+
+# ============================================================
+# РЕКУРСИВНЫЙ ПРОГНОЗ — MULTI-TARGET
+# ============================================================
+
+def _recursive_forecast_multi(
+    model,
+    history_df: pd.DataFrame,
+    targets: List[str],
+    forecast_years: List[int],
+    lags: List[int],
+    windows: List[int],
+    feature_cols: List[str],
+) -> pd.DataFrame:
+    """
+    Рекурсивный прогноз для MultiRMSE-модели (несколько таргетов одновременно).
+
+    На каждом шаге (year, month):
+      1. Строки с NaN-таргетами добавляются к растущей истории.
+      2. _add_features_multi пересчитывает лаги по уже предсказанным значениям.
+      3. Оба таргета предсказываются одновременно — модель учитывает их связь.
+      4. Прогнозы записываются обратно в историю для следующего шага.
+
+    Возвращает DataFrame: ROAD_NAME, YEAR, MONTH, *targets
+    """
+    roads = history_df["ROAD_NAME"].unique()
+    work = history_df[["ROAD_NAME", "YEAR", "MONTH"] + targets].copy()
+    results: List[pd.DataFrame] = []
+
+    for year in sorted(forecast_years):
+        for month in range(1, 13):
+            future_data: dict = {"ROAD_NAME": roads, "YEAR": year, "MONTH": month}
+            for t in targets:
+                future_data[t] = np.nan
+            future = pd.DataFrame(future_data)
+
+            combined = pd.concat([work, future], ignore_index=True)
+            combined = _add_features_multi(combined, targets, lags, windows)
+
+            pred_mask = combined[targets[0]].isna()
+            X_pred = combined.loc[pred_mask, feature_cols].copy()
+            X_pred["ROAD_NAME"] = X_pred["ROAD_NAME"].astype(str)
+            X_pred = X_pred.fillna(0)
+
+            # predict → shape (n_roads, n_targets) для MultiRMSE
+            preds = np.maximum(model.predict(X_pred), 0.0)
+
+            for i, t in enumerate(targets):
+                future[t] = preds[:, i]
+
+            work = pd.concat(
+                [work, future[["ROAD_NAME", "YEAR", "MONTH"] + targets]],
+                ignore_index=True,
+            )
+            results.append(future)
+
+    return pd.concat(results, ignore_index=True)
+
+
+# ============================================================
 # РЕКУРСИВНЫЙ ПРОГНОЗ
 # ============================================================
 
@@ -287,6 +418,7 @@ def run_catboost_forecast(
     plot_training: bool = False,
     plot_tree: bool = False,
     plot_tree_idx: int = 0,
+    plot_shap: bool = False,
 ) -> pd.DataFrame:
     """
     Прогнозирование всех целевых показателей для всех дорог.
@@ -313,6 +445,8 @@ def run_catboost_forecast(
                                в catboost_results/trees/. Требует graphviz.
                                Аналог model.plot_tree(tree_idx=0) в Jupyter.
     plot_tree_idx              : индекс дерева для plot_tree (по умолчанию 0).
+    plot_shap                  : True — сохранять SHAP-отчёт о значимости факторов
+                               в catboost_results/shap/. Один файл на модель.
 
     Возвращает
     ----------
@@ -346,13 +480,13 @@ def run_catboost_forecast(
     forecast_parts: Dict[str, pd.DataFrame] = {}   # target → прогнозный DataFrame
     metrics_rows: List[dict] = []
 
-    for target in TARGET_INDICATORS:
-        # Параметры: база → глобальный override → per-target override
+    # ── ОДИНОЧНЫЕ МОДЕЛИ (RMSE) ────────────────────────────────
+    for target in SINGLE_TARGETS:
         params = base_params.copy()
         if catboost_params_per_target and target in catboost_params_per_target:
             params.update(catboost_params_per_target[target])
 
-        print(f"  [{target}] обучение модели...")
+        print(f"  [{target}] обучение модели (RMSE)...")
 
         # ── Признаки на полных данных ──────────────────────
         full_feat = _add_features(monthly_df, target, lags, rolling_windows)
@@ -376,56 +510,106 @@ def run_catboost_forecast(
         model = CatBoostRegressor(**params)
         model.fit(train_pool, eval_set=eval_pool)
 
-        # ── Визуализация обучения ──────────────────────────
         if plot_training:
-            p = save_training_curves(
-                model, indicator=target,
-                outdir=base_out / "training_curves",
-            )
-            if p:
-                print(f"  [{target}] кривые обучения: {p}")
-
-        # ── Визуализация дерева ────────────────────────────
+            p = save_training_curves(model, indicator=target, outdir=base_out / "training_curves")
+            if p: print(f"  [{target}] кривые обучения: {p}")
         if plot_tree:
-            p = save_tree(
-                model, indicator=target,
-                outdir=base_out / "trees",
-                tree_idx=plot_tree_idx,
-            )
-            if p:
-                print(f"  [{target}] дерево (tree_idx={plot_tree_idx}): {p}")
+            p = save_tree(model, indicator=target, outdir=base_out / "trees", tree_idx=plot_tree_idx)
+            if p: print(f"  [{target}] дерево (tree_idx={plot_tree_idx}): {p}")
+        if plot_shap:
+            p = save_shap_report(model, X_test, feat_cols, indicator=target, outdir=base_out / "shap")
+            if p: print(f"  [{target}] SHAP-отчёт: {p}")
 
         # ── Метрики на тесте ───────────────────────────────
         pred_test = np.maximum(model.predict(eval_pool), 0.0)
-
         for road in monthly_df["ROAD_NAME"].unique():
             mask = test_feat["ROAD_NAME"] == road
             if mask.sum() == 0:
                 continue
             metrics_rows.append({
-                "indicator":  target,
-                "road":       road,
-                "MAPE_%":     mape_percent(y_test[mask.values], pred_test[mask.values]),
-                "SMAPE_%":    smape_percent(y_test[mask.values], pred_test[mask.values]),
-                "n_trees":    model.tree_count_,
-                "test_year":  test_year,
+                "indicator": target, "road": road,
+                "MAPE_%":    mape_percent(y_test[mask.values], pred_test[mask.values]),
+                "SMAPE_%":   smape_percent(y_test[mask.values], pred_test[mask.values]),
+                "n_trees":   model.tree_count_, "test_year": test_year,
             })
 
         # ── Рекурсивный прогноз ────────────────────────────
         forecast_part = _recursive_forecast(
             model=model,
             history_df=monthly_df[["ROAD_NAME", "YEAR", "MONTH", target]],
-            target_col=target,
-            forecast_years=forecast_years,
-            lags=lags,
-            windows=rolling_windows,
-            feature_cols=feat_cols,
+            target_col=target, forecast_years=forecast_years,
+            lags=lags, windows=rolling_windows, feature_cols=feat_cols,
         )
-        forecast_parts[target] = forecast_part.set_index(
-            ["ROAD_NAME", "YEAR", "MONTH"]
-        )[target]
-
+        forecast_parts[target] = forecast_part.set_index(["ROAD_NAME", "YEAR", "MONTH"])[target]
         print(f"  [{target}] готово. Деревьев: {model.tree_count_}")
+
+    # ── СОВМЕСТНЫЕ МОДЕЛИ (MultiRMSE) ──────────────────────────
+    for group_name, targets in MULTI_TARGET_GROUPS.items():
+        params = base_params.copy()
+        params["loss_function"] = "MultiRMSE"
+        if catboost_params_per_target and group_name in catboost_params_per_target:
+            params.update(catboost_params_per_target[group_name])
+        params["loss_function"] = "MultiRMSE"   # гарантируем после override
+
+        print(f"  [{group_name}] обучение модели (MultiRMSE): {targets}...")
+
+        multi_feat_cols = _feature_cols_multi(targets, lags, rolling_windows)
+        full_feat = _add_features_multi(
+            monthly_df[["ROAD_NAME", "YEAR", "MONTH"] + targets].copy(),
+            targets, lags, rolling_windows,
+        )
+
+        train_feat = full_feat[full_feat["YEAR"] <  test_year].dropna(subset=multi_feat_cols + targets)
+        test_feat  = full_feat[full_feat["YEAR"] == test_year].fillna(0)
+
+        X_train = train_feat[multi_feat_cols];  y_train = train_feat[targets].values  # (n, 2)
+        X_test  = test_feat[multi_feat_cols];   y_test  = test_feat[targets].values   # (n, 2)
+
+        cb_cat = [c for c in CAT_FEATURES if c in multi_feat_cols]
+        train_pool = Pool(X_train, label=y_train, cat_features=cb_cat)
+        eval_pool  = Pool(X_test,  label=y_test,  cat_features=cb_cat)
+
+        model = CatBoostRegressor(**params)
+        model.fit(train_pool, eval_set=eval_pool)
+
+        if plot_training:
+            p = save_training_curves(model, indicator=group_name, outdir=base_out / "training_curves")
+            if p: print(f"  [{group_name}] кривые обучения: {p}")
+        if plot_tree:
+            p = save_tree(model, indicator=group_name, outdir=base_out / "trees", tree_idx=plot_tree_idx)
+            if p: print(f"  [{group_name}] дерево (tree_idx={plot_tree_idx}): {p}")
+        if plot_shap:
+            p = save_shap_report(
+                model, X_test, multi_feat_cols,
+                indicator=group_name, outdir=base_out / "shap", targets=targets,
+            )
+            if p: print(f"  [{group_name}] SHAP-отчёт: {p}")
+
+        # Метрики по каждому таргету отдельно
+        pred_test = np.maximum(model.predict(eval_pool), 0.0)  # (n, 2)
+        for ti, target in enumerate(targets):
+            for road in monthly_df["ROAD_NAME"].unique():
+                mask = test_feat["ROAD_NAME"] == road
+                if mask.sum() == 0:
+                    continue
+                metrics_rows.append({
+                    "indicator": target, "road": road,
+                    "MAPE_%":    mape_percent(y_test[mask.values, ti], pred_test[mask.values, ti]),
+                    "SMAPE_%":   smape_percent(y_test[mask.values, ti], pred_test[mask.values, ti]),
+                    "n_trees":   model.tree_count_, "test_year": test_year,
+                })
+
+        # Рекурсивный прогноз обоих таргетов одновременно
+        fp_multi = _recursive_forecast_multi(
+            model=model,
+            history_df=monthly_df[["ROAD_NAME", "YEAR", "MONTH"] + targets].copy(),
+            targets=targets, forecast_years=forecast_years,
+            lags=lags, windows=rolling_windows, feature_cols=multi_feat_cols,
+        )
+        indexed = fp_multi.set_index(["ROAD_NAME", "YEAR", "MONTH"])
+        for target in targets:
+            forecast_parts[target] = indexed[target]
+        print(f"  [{group_name}] готово. Деревьев: {model.tree_count_}")
 
     # ── Сборка итогового DataFrame ─────────────────────────
     idx = pd.MultiIndex.from_product(
