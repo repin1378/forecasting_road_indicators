@@ -585,6 +585,7 @@ def run_optimization(
     outdir: str | Path = "catboost_results",
     force_refit: bool = False,
     save_importance: bool = True,
+    param_space: Optional[dict] = None,
 ) -> dict:
     """
     Полный цикл оптимизации гиперпараметров для одного показателя.
@@ -611,6 +612,10 @@ def run_optimization(
     outdir          : директория для сохранения результатов
     force_refit     : True — перезапустить оптимизацию, игнорируя кеш
     save_importance : True — сохранить HTML с важностью признаков
+    param_space     : переопределение пространства поиска.
+                      Для method="grid"   — Dict[str, list]  (аналог GRID_PARAM_SPACE).
+                      Для method="optuna" — Dict[str, dict]  (аналог OPTUNA_PARAM_SPACE).
+                      None — использовать значения по умолчанию из модуля.
 
     Возвращает
     ----------
@@ -643,6 +648,7 @@ def run_optimization(
     if method == "grid":
         best_params = optimize_model_parameters_grid(
             X_train, y_train, cat_cols,
+            param_space=param_space,
             n_splits=n_splits, seed=seed,
         )
         meta = {"method": "grid", "n_splits": n_splits}
@@ -650,6 +656,7 @@ def run_optimization(
     elif method == "optuna":
         best_params, study = optimize_model_parameters_optuna(
             X_train, y_train, cat_cols,
+            param_space=param_space,
             n_splits=n_splits, n_trials=n_trials, seed=seed,
         )
         meta = {
@@ -709,6 +716,7 @@ def run_optimization_all(
     seed: int = 42,
     outdir: str | Path = "catboost_results",
     force_refit: bool = False,
+    param_space: Optional[dict] = None,
 ) -> Dict[str, dict]:
     """
     Оптимизирует гиперпараметры для каждого показателя в targets.
@@ -716,6 +724,15 @@ def run_optimization_all(
     Поскольку каждый показатель имеет разную динамику (TRAIN_KM —
     практически монотонный тренд, LOSS_* — сезонный с шумом),
     оптимальные параметры могут существенно различаться.
+
+    Параметры
+    ----------
+    targets     : список показателей (по умолчанию все TARGET_INDICATORS).
+                  Можно передать подмножество для ускорения.
+    param_space : переопределение пространства поиска для всех показателей.
+                  Для method="grid"   — Dict[str, list].
+                  Для method="optuna" — Dict[str, dict].
+                  None — использовать GRID_PARAM_SPACE / OPTUNA_PARAM_SPACE.
 
     Возвращает
     ----------
@@ -739,6 +756,7 @@ def run_optimization_all(
             outdir=outdir,
             force_refit=force_refit,
             save_importance=True,
+            param_space=param_space,
         )
         all_best[target] = best
 
