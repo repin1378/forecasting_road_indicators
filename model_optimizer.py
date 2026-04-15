@@ -682,8 +682,11 @@ def run_optimization(
         final_params = {
             **DEFAULT_CB_PARAMS,
             **best_params,
-            "random_seed": seed,
-            "verbose":     False,
+            "random_seed":          seed,
+            "verbose":              False,
+            # eval_set не передаётся → отключаем зависящие от него параметры
+            "use_best_model":       False,
+            "early_stopping_rounds": None,
         }
         final_model = CatBoostRegressor(**final_params)
         final_model.fit(Pool(X_train, y_train, cat_features=cat_cols))
