@@ -31,10 +31,42 @@ catboost_viz.py
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+
+# ============================================================
+# АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ GRAPHVIZ В PATH (Windows)
+#
+# winget устанавливает graphviz в стандартный каталог, но PATH
+# обновляется только в новом терминале. Добавляем путь программно
+# при первом импорте модуля — без перезапуска и ручной настройки.
+# ============================================================
+
+_GRAPHVIZ_WIN_CANDIDATES = [
+    r"C:\Program Files\Graphviz\bin",
+    r"C:\Program Files (x86)\Graphviz\bin",
+    r"C:\Graphviz\bin",
+]
+
+def _ensure_graphviz_on_path() -> None:
+    """Добавляет каталог graphviz в PATH, если dot не найден (только Windows)."""
+    if sys.platform != "win32":
+        return
+    # Проверяем, доступен ли dot уже
+    import shutil
+    if shutil.which("dot"):
+        return
+    for candidate in _GRAPHVIZ_WIN_CANDIDATES:
+        if Path(candidate, "dot.exe").exists():
+            os.environ["PATH"] = candidate + os.pathsep + os.environ.get("PATH", "")
+            return
+
+_ensure_graphviz_on_path()
 
 
 # ============================================================
