@@ -36,9 +36,9 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 # загрузить готовый результат из CSV-файла.
 # ==================================================
 RUN_GENERATION   = False   # Шаг 1:   генерация monthly_df
-RUN_OPTIMIZATION = False   # Шаг 1.5: оптимизация гиперпараметров CatBoost
-RUN_FORECAST     = True    # Шаг 2:   обучение моделей и прогноз
-RUN_PLOTS        = True    # Шаг 3:   построение HTML-графиков
+RUN_OPTIMIZATION = True   # Шаг 1.5: оптимизация гиперпараметров CatBoost
+RUN_FORECAST     = False    # Шаг 2:   обучение моделей и прогноз
+RUN_PLOTS        = False    # Шаг 3:   построение HTML-графиков
 
 # Метод оптимизации: "grid" (полный перебор) или "optuna" (байесовский поиск)
 OPTIMIZE_METHOD   = "optuna"
