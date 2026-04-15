@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from catboost import CatBoostRegressor, Pool
+from catboost_viz import save_training_curves, save_tree
 
 
 # ============================================================
@@ -283,6 +284,9 @@ def run_catboost_forecast(
     random_seed: int = 42,
     catboost_params: Optional[dict] = None,
     catboost_params_per_target: Optional[Dict[str, dict]] = None,
+    plot_training: bool = False,
+    plot_tree: bool = False,
+    plot_tree_idx: int = 0,
 ) -> pd.DataFrame:
     """
     Прогнозирование всех целевых показателей для всех дорог.
@@ -302,6 +306,13 @@ def run_catboost_forecast(
                                параметрами для каждого показателя отдельно.
                                Берётся из run_optimization_all() / load_best_params().
                                Имеет приоритет над catboost_params.
+    plot_training              : True — сохранять кривые train/val RMSE по итерациям
+                               как интерактивный HTML в catboost_results/training_curves/.
+                               Аналог model.fit(..., plot=True) в Jupyter.
+    plot_tree                  : True — сохранять структуру дерева ансамбля как SVG
+                               в catboost_results/trees/. Требует graphviz.
+                               Аналог model.plot_tree(tree_idx=0) в Jupyter.
+    plot_tree_idx              : индекс дерева для plot_tree (по умолчанию 0).
 
     Возвращает
     ----------
@@ -364,6 +375,25 @@ def run_catboost_forecast(
         # ── Основная модель ────────────────────────────────
         model = CatBoostRegressor(**params)
         model.fit(train_pool, eval_set=eval_pool)
+
+        # ── Визуализация обучения ──────────────────────────
+        if plot_training:
+            p = save_training_curves(
+                model, indicator=target,
+                outdir=base_out / "training_curves",
+            )
+            if p:
+                print(f"  [{target}] кривые обучения: {p}")
+
+        # ── Визуализация дерева ────────────────────────────
+        if plot_tree:
+            p = save_tree(
+                model, indicator=target,
+                outdir=base_out / "trees",
+                tree_idx=plot_tree_idx,
+            )
+            if p:
+                print(f"  [{target}] дерево (tree_idx={plot_tree_idx}): {p}")
 
         # ── Метрики на тесте ───────────────────────────────
         pred_test = np.maximum(model.predict(eval_pool), 0.0)

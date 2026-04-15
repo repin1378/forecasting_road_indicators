@@ -36,14 +36,19 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 # загрузить готовый результат из CSV-файла.
 # ==================================================
 RUN_GENERATION   = False   # Шаг 1:   генерация monthly_df
-RUN_OPTIMIZATION = True   # Шаг 1.5: оптимизация гиперпараметров CatBoost
-RUN_FORECAST     = False    # Шаг 2:   обучение моделей и прогноз
-RUN_PLOTS        = False    # Шаг 3:   построение HTML-графиков
+RUN_OPTIMIZATION = False   # Шаг 1.5: оптимизация гиперпараметров CatBoost
+RUN_FORECAST     = True    # Шаг 2:   обучение моделей и прогноз
+RUN_PLOTS        = True    # Шаг 3:   построение HTML-графиков
 
 # Метод оптимизации: "grid" (полный перебор) или "optuna" (байесовский поиск)
 OPTIMIZE_METHOD   = "optuna"
 OPTIMIZE_N_TRIALS = 20      # число испытаний: 20 вместо 50 → в ~2.5× быстрее
 OPTIMIZE_N_SPLITS = 3       # число фолдов CV: 3 вместо 5  → в ~1.7× быстрее
+
+# Визуализация обучения CatBoost (см. habr.com/ru/companies/otus/articles/527554/)
+PLOT_TRAINING  = True    # кривые train/val RMSE → catboost_results/training_curves/
+PLOT_TREE      = True    # структура дерева SVG  → catboost_results/trees/
+PLOT_TREE_IDX  = 0       # индекс дерева для plot_tree (0 = первое дерево)
 
 MONTHLY_CSV  = OUTPUT_CSV                                  # synthetic_data/synthetic_monthly.csv
 FORECAST_CSV = Path("catboost_results/catboost_forecasts.csv")
@@ -127,6 +132,9 @@ if RUN_FORECAST:
         test_year=END_YEAR,                  # 2024 — год оценки качества
         random_seed=SEED,
         catboost_params_per_target=best_params_per_target or None,
+        plot_training=PLOT_TRAINING,
+        plot_tree=PLOT_TREE,
+        plot_tree_idx=PLOT_TREE_IDX,
     )
     print(f"[Шаг 2] Прогноз готов: {forecast_df.shape[0]} строк "
           f"(годы {forecast_years[0]}–{forecast_years[-1]})")
