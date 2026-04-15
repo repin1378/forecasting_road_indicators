@@ -42,7 +42,8 @@ RUN_PLOTS        = False    # Шаг 3:   построение HTML-график
 
 # Метод оптимизации: "grid" (полный перебор) или "optuna" (байесовский поиск)
 OPTIMIZE_METHOD   = "optuna"
-OPTIMIZE_N_TRIALS = 50      # число испытаний (только для "optuna")
+OPTIMIZE_N_TRIALS = 20      # число испытаний: 20 вместо 50 → в ~2.5× быстрее
+OPTIMIZE_N_SPLITS = 3       # число фолдов CV: 3 вместо 5  → в ~1.7× быстрее
 
 MONTHLY_CSV  = OUTPUT_CSV                                  # synthetic_data/synthetic_monthly.csv
 FORECAST_CSV = Path("catboost_results/catboost_forecasts.csv")
@@ -94,7 +95,7 @@ if RUN_OPTIMIZATION:
         monthly_df=monthly_df,
         method=OPTIMIZE_METHOD,
         n_trials=OPTIMIZE_N_TRIALS,
-        n_splits=5,
+        n_splits=OPTIMIZE_N_SPLITS,
         outdir="catboost_results",
         force_refit=True,
     )
