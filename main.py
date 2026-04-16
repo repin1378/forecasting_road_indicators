@@ -243,4 +243,4 @@ if RUN_PLOTS:
     print(f"[OK] Графики CatBoost сохранены: {len(ALL_PLOT_INDICATORS)} показателей × "
           f"{len(roads)} дорог = {len(ALL_PLOT_INDICATORS) * len(roads)} файлов")
 else:
-    print("[Шаг 5] Пропущен.")
+    print("[Шаг 5] Пропущен!")
