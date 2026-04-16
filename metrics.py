@@ -48,11 +48,21 @@ def compute_metrics(y_test, pred_test, fit_full):
         "resid_std": resid_std,
     }
 
-def mape_percent(y_true, y_pred, eps=1e-9) -> float:
+def mape_percent(y_true, y_pred, cap: float = 200.0) -> float:
+    """
+    MAPE (%), устойчивый к нулям.
+
+    Знаменатель = max(|y_true|, 1 % от среднего ряда), что исключает взрыв
+    при y_true ≈ 0 (характерно для малых дорог с редкими инцидентами).
+    Вклад каждой точки ограничен значением cap (200 % по умолчанию).
+    """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
-    denom = np.maximum(np.abs(y_true), eps)
-    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
+    mean_abs = np.abs(y_true[y_true != 0]).mean() if np.any(y_true != 0) else 1.0
+    floor    = max(mean_abs * 0.01, 1e-6)
+    denom    = np.maximum(np.abs(y_true), floor)
+    per_pt   = np.minimum(np.abs((y_true - y_pred) / denom) * 100.0, cap)
+    return float(np.mean(per_pt))
 
 
 def smape_percent(y_true, y_pred, eps=1e-9) -> float:

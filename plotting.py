@@ -82,21 +82,26 @@ def plot_predictions(
     indicator: str,
     road: str,
     outpath: "Path | str",
+    *,
+    model_name: str = "CatBoost",
+    line_color: str = "#1E64C8",
+    fill_color: str = "rgba(30, 100, 200, 0.13)",
 ) -> None:
     """
-    Строит детальный интерактивный HTML-график прогноза по образцу mlgu.ru/1004.
+    Строит детальный интерактивный HTML-график прогноза.
 
-    Доверительный интервал 95 % рассчитывается как ± CI_HALF_WIDTH (5 %)
-    от центрального прогноза: lower = forecast × 0.95, upper = forecast × 1.05.
+    Доверительный интервал 95 %:
+      • Если в forecast_df есть столбцы {indicator}_lower_95 / {indicator}_upper_95,
+        они используются напрямую (ETS — реальный σ из остатков теста).
+      • Иначе CI рассчитывается как ± CI_HALF_WIDTH (5 %) от прогноза (CatBoost).
 
     На графике:
-      • Тёмная линия + маркеры  — фактические данные
-      • Синяя пунктир + маркеры — прогноз CatBoost
-      • Синяя заливка           — доверительный интервал 95 %
-                                  (обрезан по исторической статистике)
-      • Красная вертикаль       — граница факт / прогноз
-      • Квартальные метки       — русские названия месяцев (янв, апр, …)
-      • Вспомогательная сетка   — каждый месяц
+      • Тёмная линия + маркеры   — фактические данные
+      • Цветная пунктир + маркеры — прогноз модели
+      • Цветная заливка           — доверительный интервал 95 %
+      • Красная вертикаль         — граница факт / прогноз
+      • Квартальные метки         — русские названия месяцев (янв, апр, …)
+      • Вспомогательная сетка     — каждый месяц
 
     Параметры
     ----------
@@ -106,6 +111,9 @@ def plot_predictions(
     indicator   : название столбца, напр. "TRAIN_KM"
     road        : название дороги,  напр. "Октябрьская"
     outpath     : путь для сохранения .html
+    model_name  : подпись модели в легенде (по умолчанию "CatBoost")
+    line_color  : цвет линии прогноза (hex или rgba)
+    fill_color  : цвет заливки доверительного интервала (rgba)
     """
     outpath = Path(outpath)
     outpath.parent.mkdir(parents=True, exist_ok=True)
@@ -140,12 +148,30 @@ def plot_predictions(
         ignore_index=True,
     )
 
-    # ── Доверительный интервал ± CI_HALF_WIDTH от прогноза ─
-    fcast_lower = fcast_values * (1.0 - CI_HALF_WIDTH)
-    fcast_upper = fcast_values * (1.0 + CI_HALF_WIDTH)
-    # Первая точка (стык с историей) — нулевая ширина интервала
-    fcast_lower.iloc[0] = last_value
-    fcast_upper.iloc[0] = last_value
+    # ── Доверительный интервал ─────────────────────────────
+    # Приоритет: готовые столбцы lower_95/upper_95 из forecast_df
+    # (ETS передаёт реальный σ; CatBoost — столбцы тоже есть, но CI_HALF_WIDTH)
+    lower_col = f"{indicator}_lower_95"
+    upper_col = f"{indicator}_upper_95"
+
+    if (lower_col in fcast.columns
+            and not fcast[lower_col].isna().all()):
+        fcast_lower = pd.concat(
+            [pd.Series([last_value]), fcast[lower_col].clip(lower=0)],
+            ignore_index=True,
+        )
+        fcast_upper = pd.concat(
+            [pd.Series([last_value]), fcast[upper_col].clip(lower=0)],
+            ignore_index=True,
+        )
+        ci_label = "Доверительный интервал 95 %"
+    else:
+        fcast_lower = fcast_values * (1.0 - CI_HALF_WIDTH)
+        fcast_upper = fcast_values * (1.0 + CI_HALF_WIDTH)
+        # Первая точка (стык с историей) — нулевая ширина интервала
+        fcast_lower.iloc[0] = last_value
+        fcast_upper.iloc[0] = last_value
+        ci_label = f"Доверительный интервал 95 % (±{int(CI_HALF_WIDTH * 100)} %)"
 
     # ── Диапазон Y-оси (не форсируем 0) ───────────────────
     all_y = list(hist[indicator]) + list(fcast_lower) + list(fcast_upper)
@@ -168,10 +194,10 @@ def plot_predictions(
         x=x_band,
         y=y_band,
         fill="toself",
-        fillcolor="rgba(30, 100, 200, 0.13)",
+        fillcolor=fill_color,
         line=dict(color="rgba(0,0,0,0)"),
         hoverinfo="skip",
-        name=f"Доверительный интервал 95 % (±{int(CI_HALF_WIDTH*100)} %)",
+        name=ci_label,
         legendrank=3,
     ))
 
@@ -192,9 +218,9 @@ def plot_predictions(
         x=fcast_dates,
         y=fcast_values,
         mode="lines+markers",
-        name="Прогноз CatBoost",
-        line=dict(color="#1E64C8", width=2.0, dash="dash"),
-        marker=dict(size=5, color="#1E64C8", symbol="circle-open", line=dict(width=1.5)),
+        name=f"Прогноз {model_name}",
+        line=dict(color=line_color, width=2.0, dash="dash"),
+        marker=dict(size=5, color=line_color, symbol="circle-open", line=dict(width=1.5)),
         hovertemplate="<b>Прогноз</b>  %{x|%b %Y}<br>%{y:,.0f}<extra></extra>",
         legendrank=2,
     ))

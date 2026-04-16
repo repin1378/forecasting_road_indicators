@@ -45,7 +45,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from catboost import CatBoostRegressor, Pool
 from catboost_viz import save_training_curves, save_tree, save_shap_report
@@ -93,8 +93,19 @@ COUNT_COLS: List[str] = [
     "LOSS_12_COUNT", "LOSS_3_COUNT", "LOSS_TECH_COUNT", "LOSS_COUNT_TOTAL",
 ]
 
-LAGS: List[int] = [1, 2, 3, 6, 12]
+LAGS: List[int] = [1, 2, 3, 6, 12, 24, 36]
 ROLLING_WINDOWS: List[int] = [3, 6, 12]
+
+# Лаги для кросс-индикаторных признаков (короче, чтобы не раздувать матрицу)
+CROSS_LAGS: List[int] = [1, 3, 6, 12]
+
+# TRAIN_KM используется как признак-предиктор для LOSS_* моделей:
+# объём работ напрямую влияет на число и сумму потерь от отказов.
+CROSS_INDICATORS: List[str] = ["TRAIN_KM"]
+
+# Минимальное std при z-score нормализации (защита от деления на 0 у малых/постоянных рядов).
+# Значение 1.0 нейтрально: при std < 1 нормализация фактически превращается в сдвиг на mean.
+ROAD_NORM_MIN_STD: float = 1.0
 
 # Параметры CatBoost по умолчанию (см. статьи по настройке)
 DEFAULT_CB_PARAMS: dict = {
@@ -133,11 +144,25 @@ def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
 # МЕТРИКИ
 # ============================================================
 
-def mape_percent(y_true, y_pred, eps: float = 1e-9) -> float:
+def mape_percent(y_true, y_pred, cap: float = 200.0) -> float:
+    """
+    MAPE (%), устойчивый к нулям.
+
+    Вместо деления на абсолютное значение (взрывается при y_true ≈ 0)
+    используем знаменатель = max(|y_true|, 1% от среднего ряда).
+    Вклад каждой точки ограничен значением cap (по умолчанию 200 %),
+    чтобы единственный нулевой месяц не искажал среднее.
+
+    При y_true ≡ 0 (все нули) возвращает 0.
+    """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
-    denom = np.maximum(np.abs(y_true), eps)
-    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
+    # Порог = 1 % от среднего ненулевого значения ряда (но не меньше 1e-6)
+    mean_abs = np.abs(y_true[y_true != 0]).mean() if np.any(y_true != 0) else 1.0
+    floor    = max(mean_abs * 0.01, 1e-6)
+    denom    = np.maximum(np.abs(y_true), floor)
+    per_pt   = np.minimum(np.abs((y_true - y_pred) / denom) * 100.0, cap)
+    return float(np.mean(per_pt))
 
 
 def smape_percent(y_true, y_pred, eps: float = 1e-9) -> float:
@@ -145,6 +170,71 @@ def smape_percent(y_true, y_pred, eps: float = 1e-9) -> float:
     y_pred = np.asarray(y_pred, dtype=float)
     denom = np.maximum((np.abs(y_true) + np.abs(y_pred)) / 2.0, eps)
     return float(np.mean(np.abs(y_true - y_pred) / denom) * 100.0)
+
+
+# ============================================================
+# Z-SCORE НОРМАЛИЗАЦИЯ ПО ДОРОГАМ
+# ============================================================
+
+def _compute_road_stats(
+    df: pd.DataFrame,
+    target_col: str,
+    road_col: str = "ROAD_NAME",
+    min_std: float = ROAD_NORM_MIN_STD,
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Вычисляет (mean, std) таргета отдельно по каждой дороге.
+
+    Назначение: z-score нормализация перед обучением — решает проблему
+    «Калининград vs Московская», когда разница масштабов на порядок
+    приводит к тому, что глобальная модель усредняет несопоставимые ряды.
+
+    min_std: нижняя граница std (защита от деления на 0 для постоянных рядов).
+    Вычисляется только по ненулевым ненулевым наблюдениям train-части —
+    данные test/forecast не участвуют (нет утечки).
+    """
+    stats: Dict[str, Tuple[float, float]] = {}
+    for road, group in df.groupby(road_col):
+        vals = group[target_col].dropna().values.astype(float)
+        mean = float(vals.mean()) if len(vals) > 0 else 0.0
+        std  = float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
+        stats[str(road)] = (mean, max(std, min_std))
+    return stats
+
+
+def _normalize_target(
+    y: np.ndarray,
+    roads: np.ndarray,
+    road_stats: Dict[str, Tuple[float, float]],
+) -> np.ndarray:
+    """
+    Применяет z-score нормализацию: y_norm = (y - mean[road]) / std[road].
+
+    Векторизованная реализация — без Python-цикла по строкам.
+    Дороги, отсутствующие в road_stats, получают (mean=0, std=1) — нейтральное значение.
+    """
+    roads = np.asarray(roads, dtype=str)
+    means = np.array([road_stats.get(r, (0.0, 1.0))[0] for r in roads])
+    stds  = np.array([road_stats.get(r, (0.0, 1.0))[1] for r in roads])
+    return (np.asarray(y, dtype=float) - means) / stds
+
+
+def _denormalize_target(
+    y_norm: np.ndarray,
+    roads: np.ndarray,
+    road_stats: Dict[str, Tuple[float, float]],
+    clip_zero: bool = True,
+) -> np.ndarray:
+    """
+    Обратная трансформация: y = y_norm * std[road] + mean[road].
+
+    clip_zero=True: отрицательные значения обнуляются (счётчики и суммы ≥ 0).
+    """
+    roads = np.asarray(roads, dtype=str)
+    means = np.array([road_stats.get(r, (0.0, 1.0))[0] for r in roads])
+    stds  = np.array([road_stats.get(r, (0.0, 1.0))[1] for r in roads])
+    y = np.asarray(y_norm, dtype=float) * stds + means
+    return np.maximum(y, 0.0) if clip_zero else y
 
 
 # ============================================================
@@ -164,14 +254,30 @@ def _add_features(
     отсутствие утечки между дорогами.
 
     Признаки:
+        road_mean / road_std  — исторический масштаб дороги по показателю
+                                (вычисляется по ненулевым наблюдениям, без NaN)
         month_sin / month_cos — циклическое кодирование сезонности
         t                     — линейный индекс времени (тренд)
         lag_{k}               — значение за k месяцев назад
         roll_mean_{w}         — скользящее среднее за w месяцев (сдвиг 1)
         roll_std_{w}          — скользящее СКО за w месяцев (сдвиг 1)
         diff_1 / diff_12      — разности 1-го и 12-го порядка
+
+    road_mean / road_std — ключевые признаки для глобальной модели:
+    сообщают CatBoost, что Калининградская дорога работает на порядок меньшем
+    масштабе, чем Приволжская, и это нормально, а не аномалия.
+    Вычисляются только по наблюдаемым (не-NaN) значениям — в рекурсивном
+    прогнозе будущие строки имеют NaN, но получают корректный исторический σ.
     """
     df = df.sort_values(["ROAD_NAME", "YEAR", "MONTH"]).reset_index(drop=True)
+
+    # ── Масштабные признаки дороги ─────────────────────────────
+    # Считаем только по ненулевым ненулевым наблюдениям (исторические строки).
+    observed = df[df[target_col].notna()]
+    road_mean = observed.groupby("ROAD_NAME")[target_col].mean()
+    road_std  = observed.groupby("ROAD_NAME")[target_col].std().fillna(0)
+    df["road_mean"] = df["ROAD_NAME"].map(road_mean).fillna(0)
+    df["road_std"]  = df["ROAD_NAME"].map(road_std).fillna(0)
 
     # Циклическое кодирование месяца
     df["month_sin"] = np.sin(2 * np.pi * df["MONTH"] / 12)
@@ -203,17 +309,25 @@ def _add_features(
         df.loc[idx, "diff_1"]  = vals.diff(1).values
         df.loc[idx, "diff_12"] = vals.diff(12).values
 
+        # YoY-коэффициент: lag_1 / lag_13 = прошлый месяц / тот же месяц год назад.
+        # shift(13) вместо shift(12) исключает утечку текущего значения.
+        # fillna(1.0) — нейтральное значение при нехватке истории.
+        lag1  = vals.shift(1)
+        lag13 = vals.shift(13).replace(0, np.nan)
+        df.loc[idx, "yoy_ratio"] = (lag1 / lag13).fillna(1.0).values
+
     return df
 
 
 def _feature_cols(lags: List[int], windows: List[int]) -> List[str]:
     """Возвращает упорядоченный список признаков (без целевой переменной)."""
     cols = list(CAT_FEATURES)                        # ROAD_NAME, YEAR, MONTH
+    cols += ["road_mean", "road_std"]                # масштаб дороги
     cols += ["month_sin", "month_cos", "t"]          # сезонность + тренд
     cols += [f"lag_{l}"       for l in lags]         # лаги
     cols += [f"roll_mean_{w}" for w in windows]      # скользящие средние
     cols += [f"roll_std_{w}"  for w in windows]      # скользящие СКО
-    cols += ["diff_1", "diff_12"]                    # разности
+    cols += ["diff_1", "diff_12", "yoy_ratio"]       # разности + YoY-коэффициент
     return cols
 
 
@@ -226,17 +340,36 @@ def _add_features_multi(
     targets: List[str],
     lags: List[int],
     windows: List[int],
+    cross_cols: Optional[List[str]] = None,
+    cross_lags: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     """
     Строит матрицу признаков для нескольких целевых переменных одновременно.
 
     Для каждого таргета создаются признаки с суффиксом _{TARGET}:
-        lag_1_LOSS_12_COUNT, roll_mean_3_LOSS_12_SUM, diff_12_LOSS_12_COUNT …
+        road_mean_{T} / road_std_{T} — масштаб дороги по каждому таргету
+        lag_k_{T}, roll_mean_w_{T}, diff_12_{T} …
+        yoy_ratio_{T}               — lag_1 / lag_13 (YoY-коэффициент без утечки)
+
+    cross_cols (напр. ["TRAIN_KM"]): дополнительные столбцы, для которых строятся
+        только лаги (cross_lags). df должен содержать эти столбцы.
+        Переносят информацию из смежных показателей: объём работы TRAIN_KM →
+        ожидаемое число и сумму потерь от отказов.
 
     Общие структурные признаки (month_sin, month_cos, t) добавляются один раз.
-    В df должны присутствовать все столбцы из targets.
     """
+    cross_cols = cross_cols or []
+    cross_lags = cross_lags or []
+
     df = df.sort_values(["ROAD_NAME", "YEAR", "MONTH"]).reset_index(drop=True)
+
+    # ── Масштабные признаки дороги (по каждому таргету) ────────
+    for target in targets:
+        observed = df[df[target].notna()]
+        road_mean = observed.groupby("ROAD_NAME")[target].mean()
+        road_std  = observed.groupby("ROAD_NAME")[target].std().fillna(0)
+        df[f"road_mean_{target}"] = df["ROAD_NAME"].map(road_mean).fillna(0)
+        df[f"road_std_{target}"]  = df["ROAD_NAME"].map(road_std).fillna(0)
 
     df["month_sin"] = np.sin(2 * np.pi * df["MONTH"] / 12)
     df["month_cos"] = np.cos(2 * np.pi * df["MONTH"] / 12)
@@ -244,6 +377,8 @@ def _add_features_multi(
 
     for road, gdf in df.groupby("ROAD_NAME", sort=False):
         idx = gdf.index
+
+        # ── Основные признаки по каждому таргету ───────────────
         for target in targets:
             vals = gdf[target]
             for lag in lags:
@@ -259,6 +394,20 @@ def _add_features_multi(
             df.loc[idx, f"diff_1_{target}"]  = vals.diff(1).values
             df.loc[idx, f"diff_12_{target}"] = vals.diff(12).values
 
+            # YoY-коэффициент (lag_1 / lag_13): рост последнего месяца к
+            # тому же месяцу прошлого года. fillna(1.0) — нейтральное значение.
+            lag1  = vals.shift(1)
+            lag13 = vals.shift(13).replace(0, np.nan)
+            df.loc[idx, f"yoy_ratio_{target}"] = (lag1 / lag13).fillna(1.0).values
+
+        # ── Кросс-индикаторные лаги (напр. TRAIN_KM) ───────────
+        for ccol in cross_cols:
+            if ccol not in gdf.columns:
+                continue
+            cvals = gdf[ccol]
+            for lag in cross_lags:
+                df.loc[idx, f"lag_{lag}_{ccol}"] = cvals.shift(lag).values
+
     return df
 
 
@@ -266,15 +415,24 @@ def _feature_cols_multi(
     targets: List[str],
     lags: List[int],
     windows: List[int],
+    cross_cols: Optional[List[str]] = None,
+    cross_lags: Optional[List[int]] = None,
 ) -> List[str]:
     """Возвращает список признаков для многоцелевой модели."""
+    cross_cols = cross_cols or []
+    cross_lags = cross_lags or []
+
     cols = list(CAT_FEATURES)               # ROAD_NAME, YEAR, MONTH
     cols += ["month_sin", "month_cos", "t"] # сезонность + тренд
     for target in targets:
+        cols += [f"road_mean_{target}", f"road_std_{target}"]   # масштаб дороги
         cols += [f"lag_{l}_{target}"        for l in lags]
         cols += [f"roll_mean_{w}_{target}"  for w in windows]
         cols += [f"roll_std_{w}_{target}"   for w in windows]
         cols += [f"diff_1_{target}", f"diff_12_{target}"]
+        cols += [f"yoy_ratio_{target}"]                         # YoY-коэффициент
+    for ccol in cross_cols:
+        cols += [f"lag_{l}_{ccol}" for l in cross_lags]         # кросс-индикаторы
     return cols
 
 
@@ -290,20 +448,40 @@ def _recursive_forecast_multi(
     lags: List[int],
     windows: List[int],
     feature_cols: List[str],
+    cross_cols: Optional[List[str]] = None,
+    cross_lags: Optional[List[int]] = None,
+    cross_future_df: Optional[pd.DataFrame] = None,
+    road_stats_multi: Optional[Dict[str, Dict[str, Tuple[float, float]]]] = None,
 ) -> pd.DataFrame:
     """
     Рекурсивный прогноз для MultiRMSE-модели (несколько таргетов одновременно).
 
     На каждом шаге (year, month):
       1. Строки с NaN-таргетами добавляются к растущей истории.
-      2. _add_features_multi пересчитывает лаги по уже предсказанным значениям.
+      2. _add_features_multi пересчитывает лаги по уже предсказанным значениям,
+         включая лаги кросс-индикаторов из cross_future_df (напр. TRAIN_KM).
       3. Оба таргета предсказываются одновременно — модель учитывает их связь.
-      4. Прогнозы записываются обратно в историю для следующего шага.
+      4. Предсказания денормализуются (z-score → исходный масштаб) перед
+         записью в историю — история всегда хранится в исходном масштабе,
+         что гарантирует корректность лагов на следующем шаге.
+
+    cross_future_df (опционально): DataFrame с колонками
+        (ROAD_NAME, YEAR, MONTH, *cross_cols) для лет forecast_years.
+        Передаётся прогноз TRAIN_KM, полученный на предыдущем шаге.
 
     Возвращает DataFrame: ROAD_NAME, YEAR, MONTH, *targets
     """
+    cross_cols = cross_cols or []
+    cross_lags = cross_lags or []
+
     roads = history_df["ROAD_NAME"].unique()
-    work = history_df[["ROAD_NAME", "YEAR", "MONTH"] + targets].copy()
+
+    # work хранит историю в исходном масштабе (после денормализации)
+    hist_keep = ["ROAD_NAME", "YEAR", "MONTH"] + targets
+    for ccol in cross_cols:
+        if ccol in history_df.columns:
+            hist_keep.append(ccol)
+    work = history_df[[c for c in hist_keep if c in history_df.columns]].copy()
     results: List[pd.DataFrame] = []
 
     for year in sorted(forecast_years):
@@ -311,10 +489,28 @@ def _recursive_forecast_multi(
             future_data: dict = {"ROAD_NAME": roads, "YEAR": year, "MONTH": month}
             for t in targets:
                 future_data[t] = np.nan
+
+            # Кросс-признаки для будущей строки: берём из cross_future_df
+            for ccol in cross_cols:
+                if cross_future_df is not None and ccol in cross_future_df.columns:
+                    mask_cf = (
+                        (cross_future_df["YEAR"]  == year) &
+                        (cross_future_df["MONTH"] == month)
+                    )
+                    cf_slice = cross_future_df.loc[mask_cf].set_index("ROAD_NAME")
+                    future_data[ccol] = [
+                        cf_slice.at[r, ccol] if r in cf_slice.index else np.nan
+                        for r in roads
+                    ]
+                else:
+                    future_data[ccol] = np.nan
+
             future = pd.DataFrame(future_data)
 
             combined = pd.concat([work, future], ignore_index=True)
-            combined = _add_features_multi(combined, targets, lags, windows)
+            combined = _add_features_multi(
+                combined, targets, lags, windows, cross_cols, cross_lags
+            )
 
             pred_mask = combined[targets[0]].isna()
             X_pred = combined.loc[pred_mask, feature_cols].copy()
@@ -322,16 +518,29 @@ def _recursive_forecast_multi(
             X_pred = X_pred.fillna(0)
 
             # predict → shape (n_roads, n_targets) для MultiRMSE
-            preds = np.maximum(model.predict(X_pred), 0.0)
+            raw_preds = model.predict(X_pred)
+            preds = np.zeros_like(raw_preds, dtype=float)
+            road_arr = future["ROAD_NAME"].values
+            for i, t in enumerate(targets):
+                if road_stats_multi and t in road_stats_multi:
+                    preds[:, i] = _denormalize_target(
+                        raw_preds[:, i], road_arr, road_stats_multi[t]
+                    )
+                else:
+                    preds[:, i] = np.maximum(raw_preds[:, i], 0.0)
 
             for i, t in enumerate(targets):
                 future[t] = preds[:, i]
 
+            work_append_cols = ["ROAD_NAME", "YEAR", "MONTH"] + targets
+            for ccol in cross_cols:
+                if ccol in future.columns:
+                    work_append_cols.append(ccol)
             work = pd.concat(
-                [work, future[["ROAD_NAME", "YEAR", "MONTH"] + targets]],
+                [work, future[[c for c in work_append_cols if c in future.columns]]],
                 ignore_index=True,
             )
-            results.append(future)
+            results.append(future[["ROAD_NAME", "YEAR", "MONTH"] + targets])
 
     return pd.concat(results, ignore_index=True)
 
@@ -348,6 +557,7 @@ def _recursive_forecast(
     lags: List[int],
     windows: List[int],
     feature_cols: List[str],
+    road_stats: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> pd.DataFrame:
     """
     Рекурсивный прогноз для всех дорог на forecast_years.
@@ -355,7 +565,12 @@ def _recursive_forecast(
     На каждом шаге (year, month):
       1. Строки с NaN-target добавляются к растущей истории.
       2. _add_features пересчитывает лаги с учётом уже предсказанных значений.
-      3. Прогнозы записываются обратно в историю для следующего шага.
+      3. Прогнозы денормализуются (z-score → исходный масштаб) и записываются
+         обратно в историю — work DataFrame хранит исходные значения,
+         что гарантирует корректность лагов на следующем шаге.
+
+    road_stats: словарь {road: (mean, std)} из _compute_road_stats.
+                None → денормализация не применяется (прогноз без нормировки).
 
     Возвращает DataFrame: ROAD_NAME, YEAR, MONTH, target_col
     """
@@ -388,9 +603,14 @@ def _recursive_forecast(
             # NaN в лаговых признаках (начало истории) → 0
             X_pred = X_pred.fillna(0)
 
-            preds = np.maximum(model.predict(X_pred), 0.0)
+            raw_preds = model.predict(X_pred)
+            if road_stats is not None:
+                # Денормализация z-score → исходный масштаб
+                preds = _denormalize_target(raw_preds, future["ROAD_NAME"].values, road_stats)
+            else:
+                preds = np.maximum(raw_preds, 0.0)
 
-            # Записываем прогнозы
+            # Записываем прогнозы в исходном масштабе (history всегда original-scale)
             future[target_col] = preds
             work = pd.concat(
                 [work, future[["ROAD_NAME", "YEAR", "MONTH", target_col]]],
@@ -480,6 +700,12 @@ def run_catboost_forecast(
     forecast_parts: Dict[str, pd.DataFrame] = {}   # target → прогнозный DataFrame
     metrics_rows: List[dict] = []
 
+    # Хранилища тестовых прогнозов для вычисления метрик производных показателей
+    # (LOSS_COUNT_TOTAL, LOSS_SUM_TOTAL, SPECIFIC_LOSS)
+    _test_pred_store:   Dict[str, np.ndarray] = {}
+    _test_actual_store: Dict[str, np.ndarray] = {}
+    _test_roads_ref:    Optional[np.ndarray]  = None
+
     # ── ОДИНОЧНЫЕ МОДЕЛИ (RMSE) ────────────────────────────────
     for target in SINGLE_TARGETS:
         params = base_params.copy()
@@ -496,15 +722,24 @@ def run_catboost_forecast(
 
         X_train = train_feat[feat_cols]
         y_train = train_feat[target].values
+        roads_train = train_feat["ROAD_NAME"].values
 
         X_test  = test_feat[feat_cols]
-        y_test  = test_feat[target].values
+        y_test  = test_feat[target].values   # исходный масштаб — для метрик
+        roads_test = test_feat["ROAD_NAME"].values
 
-        # ── CatBoost Pool (категориальные признаки по имени) ──
+        # ── Z-score нормализация по дорогам ───────────────────────
+        # Калининград и другие дороги нетипичного масштаба получают
+        # равный вес — модель обучается на безразмерных отклонениях.
+        road_stats = _compute_road_stats(train_feat, target)
+        y_train_norm = _normalize_target(y_train, roads_train, road_stats)
+        y_test_norm  = _normalize_target(y_test,  roads_test,  road_stats)
+
+        # ── CatBoost Pool (категориальные признаки по имени) ──────
         cb_cat = [c for c in CAT_FEATURES if c in feat_cols]
 
-        train_pool = Pool(X_train, label=y_train, cat_features=cb_cat)
-        eval_pool  = Pool(X_test,  label=y_test,  cat_features=cb_cat)
+        train_pool = Pool(X_train, label=y_train_norm, cat_features=cb_cat)
+        eval_pool  = Pool(X_test,  label=y_test_norm,  cat_features=cb_cat)
 
         # ── Основная модель ────────────────────────────────
         model = CatBoostRegressor(**params)
@@ -520,8 +755,16 @@ def run_catboost_forecast(
             p = save_shap_report(model, X_test, feat_cols, indicator=target, outdir=base_out / "shap")
             if p: print(f"  [{target}] SHAP-отчёт: {p}")
 
-        # ── Метрики на тесте ───────────────────────────────
-        pred_test = np.maximum(model.predict(eval_pool), 0.0)
+        # ── Метрики в исходном масштабе (денормализация) ──────────
+        pred_test_norm = model.predict(eval_pool)
+        pred_test = _denormalize_target(pred_test_norm, roads_test, road_stats)
+
+        # Сохраняем для вычисления метрик производных показателей
+        _test_pred_store[target]   = pred_test
+        _test_actual_store[target] = y_test
+        if _test_roads_ref is None:
+            _test_roads_ref = roads_test
+
         for road in monthly_df["ROAD_NAME"].unique():
             mask = test_feat["ROAD_NAME"] == road
             if mask.sum() == 0:
@@ -539,6 +782,7 @@ def run_catboost_forecast(
             history_df=monthly_df[["ROAD_NAME", "YEAR", "MONTH", target]],
             target_col=target, forecast_years=forecast_years,
             lags=lags, windows=rolling_windows, feature_cols=feat_cols,
+            road_stats=road_stats,
         )
         forecast_parts[target] = forecast_part.set_index(["ROAD_NAME", "YEAR", "MONTH"])[target]
         print(f"  [{target}] готово. Деревьев: {model.tree_count_}")
@@ -551,23 +795,43 @@ def run_catboost_forecast(
             params.update(catboost_params_per_target[group_name])
         params["loss_function"] = "MultiRMSE"   # гарантируем после override
 
-        print(f"  [{group_name}] обучение модели (MultiRMSE): {targets}...")
+        print(f"  [{group_name}] обучение модели (MultiRMSE + cross: {CROSS_INDICATORS}): {targets}...")
 
-        multi_feat_cols = _feature_cols_multi(targets, lags, rolling_windows)
-        full_feat = _add_features_multi(
-            monthly_df[["ROAD_NAME", "YEAR", "MONTH"] + targets].copy(),
+        # ── Кросс-признаки: добавляем TRAIN_KM в обучающую выборку ─
+        multi_cols_for_feat = ["ROAD_NAME", "YEAR", "MONTH"] + targets + CROSS_INDICATORS
+        multi_feat_cols = _feature_cols_multi(
             targets, lags, rolling_windows,
+            cross_cols=CROSS_INDICATORS, cross_lags=CROSS_LAGS,
+        )
+        full_feat = _add_features_multi(
+            monthly_df[[c for c in multi_cols_for_feat if c in monthly_df.columns]].copy(),
+            targets, lags, rolling_windows,
+            cross_cols=CROSS_INDICATORS, cross_lags=CROSS_LAGS,
         )
 
         train_feat = full_feat[full_feat["YEAR"] <  test_year].dropna(subset=multi_feat_cols + targets)
         test_feat  = full_feat[full_feat["YEAR"] == test_year].fillna(0)
 
-        X_train = train_feat[multi_feat_cols];  y_train = train_feat[targets].values  # (n, 2)
-        X_test  = test_feat[multi_feat_cols];   y_test  = test_feat[targets].values   # (n, 2)
+        X_train = train_feat[multi_feat_cols]
+        X_test  = test_feat[multi_feat_cols]
+        y_train = train_feat[targets].values   # (n, 2) — исходный масштаб
+        y_test  = test_feat[targets].values    # (n, 2) — исходный масштаб
+        roads_train = train_feat["ROAD_NAME"].values
+        roads_test  = test_feat["ROAD_NAME"].values
+
+        # ── Z-score нормализация — отдельно для каждого таргета ───
+        road_stats_multi: Dict[str, Dict[str, Tuple[float, float]]] = {}
+        y_train_norm = np.zeros_like(y_train, dtype=float)
+        y_test_norm  = np.zeros_like(y_test,  dtype=float)
+        for ti, t in enumerate(targets):
+            stats = _compute_road_stats(train_feat, t)
+            road_stats_multi[t] = stats
+            y_train_norm[:, ti] = _normalize_target(y_train[:, ti], roads_train, stats)
+            y_test_norm[:, ti]  = _normalize_target(y_test[:, ti],  roads_test,  stats)
 
         cb_cat = [c for c in CAT_FEATURES if c in multi_feat_cols]
-        train_pool = Pool(X_train, label=y_train, cat_features=cb_cat)
-        eval_pool  = Pool(X_test,  label=y_test,  cat_features=cb_cat)
+        train_pool = Pool(X_train, label=y_train_norm, cat_features=cb_cat)
+        eval_pool  = Pool(X_test,  label=y_test_norm,  cat_features=cb_cat)
 
         model = CatBoostRegressor(**params)
         model.fit(train_pool, eval_set=eval_pool)
@@ -585,31 +849,77 @@ def run_catboost_forecast(
             )
             if p: print(f"  [{group_name}] SHAP-отчёт: {p}")
 
-        # Метрики по каждому таргету отдельно
-        pred_test = np.maximum(model.predict(eval_pool), 0.0)  # (n, 2)
+        # Метрики по каждому таргету в исходном масштабе (денормализация)
+        raw_pred_test = model.predict(eval_pool)           # нормированное пространство
         for ti, target in enumerate(targets):
+            pred_col = _denormalize_target(
+                raw_pred_test[:, ti], roads_test, road_stats_multi[target]
+            )
+
+            # Сохраняем для метрик производных показателей
+            _test_pred_store[target]   = pred_col
+            _test_actual_store[target] = y_test[:, ti]
+            if _test_roads_ref is None:
+                _test_roads_ref = roads_test
+
             for road in monthly_df["ROAD_NAME"].unique():
                 mask = test_feat["ROAD_NAME"] == road
                 if mask.sum() == 0:
                     continue
                 metrics_rows.append({
                     "indicator": target, "road": road,
-                    "MAPE_%":    mape_percent(y_test[mask.values, ti], pred_test[mask.values, ti]),
-                    "SMAPE_%":   smape_percent(y_test[mask.values, ti], pred_test[mask.values, ti]),
+                    "MAPE_%":    mape_percent(y_test[mask.values, ti], pred_col[mask.values]),
+                    "SMAPE_%":   smape_percent(y_test[mask.values, ti], pred_col[mask.values]),
                     "n_trees":   model.tree_count_, "test_year": test_year,
                 })
 
-        # Рекурсивный прогноз обоих таргетов одновременно
+        # ── Рекурсивный прогноз: TRAIN_KM из уже готового прогноза ─
+        cross_future_df = None
+        if "TRAIN_KM" in forecast_parts:
+            cross_future_df = forecast_parts["TRAIN_KM"].reset_index()
+
         fp_multi = _recursive_forecast_multi(
             model=model,
-            history_df=monthly_df[["ROAD_NAME", "YEAR", "MONTH"] + targets].copy(),
+            history_df=monthly_df[
+                [c for c in multi_cols_for_feat if c in monthly_df.columns]
+            ].copy(),
             targets=targets, forecast_years=forecast_years,
             lags=lags, windows=rolling_windows, feature_cols=multi_feat_cols,
+            cross_cols=CROSS_INDICATORS, cross_lags=CROSS_LAGS,
+            cross_future_df=cross_future_df,
+            road_stats_multi=road_stats_multi,
         )
         indexed = fp_multi.set_index(["ROAD_NAME", "YEAR", "MONTH"])
         for target in targets:
             forecast_parts[target] = indexed[target]
         print(f"  [{group_name}] готово. Деревьев: {model.tree_count_}")
+
+    # ── Метрики производных показателей ──────────────────────────────────────────
+    # LOSS_COUNT_TOTAL, LOSS_SUM_TOTAL, SPECIFIC_LOSS — вычисляются из прогнозов
+    # тест-периода; SMAPE сравнивает производные фактические и прогнозные значения.
+    if len(_test_pred_store) == len(TARGET_INDICATORS) and _test_roads_ref is not None:
+        _pred_df   = pd.DataFrame({"ROAD_NAME": _test_roads_ref})
+        _actual_df = pd.DataFrame({"ROAD_NAME": _test_roads_ref})
+        for _t in TARGET_INDICATORS:
+            _pred_df[_t]   = _test_pred_store[_t]
+            _actual_df[_t] = _test_actual_store[_t]
+        _pred_derived   = compute_derived(_pred_df)
+        _actual_derived = compute_derived(_actual_df)
+        for _ind in DERIVED_INDICATORS:
+            for road in monthly_df["ROAD_NAME"].unique():
+                _mask = _test_roads_ref == road
+                if _mask.sum() == 0:
+                    continue
+                metrics_rows.append({
+                    "indicator": _ind, "road": road,
+                    "MAPE_%":    mape_percent(
+                        _actual_derived[_ind].values[_mask],
+                        _pred_derived[_ind].values[_mask]),
+                    "SMAPE_%":   smape_percent(
+                        _actual_derived[_ind].values[_mask],
+                        _pred_derived[_ind].values[_mask]),
+                    "n_trees":   0, "test_year": test_year,
+                })
 
     # ── Сборка итогового DataFrame ─────────────────────────
     idx = pd.MultiIndex.from_product(
@@ -639,6 +949,13 @@ def run_catboost_forecast(
         if col in out.columns:
             out[f"{col}_lower_95"] = (out[col] * (1.0 - CI_HALF_WIDTH)).clip(lower=0)
             out[f"{col}_upper_95"] =  out[col] * (1.0 + CI_HALF_WIDTH)
+
+    # CI счётчиков — целые числа (lower/upper не могут быть дробными)
+    for col in COUNT_COLS:
+        for suffix in ("_lower_95", "_upper_95"):
+            ci_col = f"{col}{suffix}"
+            if ci_col in out.columns:
+                out[ci_col] = out[ci_col].round().astype(int)
 
     # Порядок столбцов: сначала значения, затем CI-пары рядом с каждым показателем
     id_cols = ["ROAD_NAME", "YEAR", "MONTH"]

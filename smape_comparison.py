@@ -32,13 +32,31 @@ import pandas as pd
 # ============================================================
 
 #: ETS-коды → канонический ключ показателя
+#
+#  Поддерживаются два формата:
+#    • Старый (строчные коды): train_km, loss_12, …
+#    • Новый  (заглавные коды, аналог CatBoost): TRAIN_KM, LOSS_12_COUNT, …
+#
+#  В _read_ets сначала пробуется прямое сопоставление (новый формат),
+#  затем — после str.lower() (старый формат).
 ETS_TO_CANONICAL: dict[str, str] = {
+    # ── Старый формат (строчные) ──────────────────────────────
     "train_km":   "TRAIN_KM",
     "loss_12":    "LOSS_12",
     "loss_3":     "LOSS_3",
     "loss_tech":  "LOSS_TECH",
     "loss_total": "LOSS_TOTAL",
     "specific":   "SPECIFIC_LOSS",
+    # ── Новый формат (заглавные, аналогичен CB_TO_CANONICAL) ──
+    "TRAIN_KM":         "TRAIN_KM",
+    "LOSS_12_COUNT":    "LOSS_12",
+    "LOSS_12_SUM":      "LOSS_12",
+    "LOSS_3_COUNT":     "LOSS_3",
+    "LOSS_3_SUM":       "LOSS_3",
+    "LOSS_TECH_COUNT":  "LOSS_TECH",
+    "LOSS_TECH_SUM":    "LOSS_TECH",
+    "LOSS_COUNT_TOTAL": "LOSS_TOTAL",
+    "SPECIFIC_LOSS":    "SPECIFIC_LOSS",
 }
 
 #: CatBoost-коды → канонический ключ
@@ -166,13 +184,23 @@ ROAD_FULL_NAMES: dict[str, str] = {
     "Двост":  "Дальневосточная",
 }
 
-# Порядок показателей в сводном отчёте
+# Порядок показателей в сводном отчёте (агрегированный: COUNT+SUM вместе)
 INDICATOR_ORDER: list[str] = [
     "TRAIN_KM",
     "LOSS_12",
     "LOSS_3",
     "LOSS_TECH",
     "LOSS_TOTAL",
+    "SPECIFIC_LOSS",
+]
+
+# Порядок показателей в детальном отчёте COUNT/SUM (развёрнутый)
+INDICATOR_ORDER_SPLIT: list[str] = [
+    "TRAIN_KM",
+    "LOSS_12_COUNT", "LOSS_12_SUM",
+    "LOSS_3_COUNT",  "LOSS_3_SUM",
+    "LOSS_TECH_COUNT", "LOSS_TECH_SUM",
+    "LOSS_COUNT_TOTAL", "LOSS_SUM_TOTAL",
     "SPECIFIC_LOSS",
 ]
 
@@ -198,8 +226,12 @@ def _read_ets(path: Path) -> pd.DataFrame:
     # Полные названия дорог
     df["road"] = df["road"].map(ROAD_FULL_NAMES).fillna(df["road"])
 
-    # Канонические коды показателей
-    df["indicator"] = df["indicator"].str.lower().map(ETS_TO_CANONICAL).fillna(df["indicator"])
+    # Канонические коды показателей.
+    # Новый формат (TRAIN_KM, LOSS_12_COUNT, …) — прямое сопоставление.
+    # Старый формат (train_km, loss_12, …)       — через str.lower().
+    direct_map = df["indicator"].map(ETS_TO_CANONICAL)
+    lower_map  = df["indicator"].str.lower().map(ETS_TO_CANONICAL)
+    df["indicator"] = direct_map.fillna(lower_map).fillna(df["indicator"])
 
     # ETS может содержать несколько строк на (indicator, road) —
     # разные тестовые периоды или типы моделей (AAA / AA / A).
@@ -216,6 +248,7 @@ def _read_catboost(path: Path) -> pd.DataFrame:
     """
     Читает CatBoost-метрики, нормализует имена показателей до канонических,
     усредняя COUNT и SUM внутри каждой группы для одного road.
+    Используется для агрегированного сравнения (LOSS_12 = среднее COUNT+SUM).
     """
     df = pd.read_csv(path, encoding="utf-8-sig")
 
@@ -239,25 +272,115 @@ def _read_catboost(path: Path) -> pd.DataFrame:
     return df
 
 
+def _read_catboost_split(path: Path) -> pd.DataFrame:
+    """
+    Читает CatBoost-метрики БЕЗ агрегации COUNT/SUM.
+    Возвращает строки с оригинальными кодами: LOSS_12_COUNT, LOSS_12_SUM и т.д.
+    Используется для детального сравнения с разбивкой на COUNT и SUM.
+    """
+    df = pd.read_csv(path, encoding="utf-8-sig")
+
+    smape_col = next(
+        (c for c in df.columns if "smape" in c.lower()), None
+    )
+    if smape_col is None:
+        raise KeyError(f"Столбец SMAPE не найден в {path}. Столбцы: {df.columns.tolist()}")
+    df = df.rename(columns={smape_col: "SMAPE_CatBoost"})
+
+    # Используем INDICATOR_ORDER_SPLIT как фильтр, чтобы включить
+    # LOSS_SUM_TOTAL и все производные показатели
+    df = df[df["indicator"].isin(INDICATOR_ORDER_SPLIT)].copy()
+    # indicator остаётся оригинальным (LOSS_12_COUNT, LOSS_12_SUM, …)
+
+    df = (
+        df.groupby(["indicator", "road"], as_index=False)
+        .agg(SMAPE_CatBoost=("SMAPE_CatBoost", "mean"))
+    )
+    return df
+
+
+def _read_ets_split(path: Path) -> pd.DataFrame:
+    """
+    Читает ETS-метрики БЕЗ агрегации: показатели LOSS_12_COUNT, LOSS_12_SUM
+    остаются раздельными. Если ETS-файл содержит только агрегированные коды
+    (старый формат), строки дублируются на COUNT и SUM с одинаковым SMAPE
+    (лучшее приближение при отсутствии раздельных данных).
+    """
+    df = pd.read_csv(path, encoding="utf-8-sig")
+
+    smape_col = next(
+        (c for c in df.columns if "smape" in c.lower()), None
+    )
+    if smape_col is None:
+        raise KeyError(f"Столбец SMAPE не найден в {path}. Столбцы: {df.columns.tolist()}")
+    df = df.rename(columns={smape_col: "SMAPE_ETS"})
+
+    df["road"] = df["road"].map(ROAD_FULL_NAMES).fillna(df["road"])
+
+    # Новый формат (LOSS_12_COUNT, LOSS_12_SUM, …) — уже раздельный, берём как есть
+    split_indicators = set(INDICATOR_ORDER_SPLIT)
+    new_format_mask = df["indicator"].isin(split_indicators)
+
+    if new_format_mask.any():
+        # ETS-файл уже содержит раздельные показатели
+        df = df[new_format_mask].copy()
+    else:
+        # Старый формат: агрегированные LOSS_12 → разворачиваем в COUNT + SUM
+        EXPAND_MAP: dict[str, list[str]] = {
+            "LOSS_12":   ["LOSS_12_COUNT",    "LOSS_12_SUM"],
+            "LOSS_3":    ["LOSS_3_COUNT",      "LOSS_3_SUM"],
+            "LOSS_TECH": ["LOSS_TECH_COUNT",   "LOSS_TECH_SUM"],
+        }
+        direct_map = df["indicator"].map(ETS_TO_CANONICAL)
+        lower_map  = df["indicator"].str.lower().map(ETS_TO_CANONICAL)
+        df["indicator_canon"] = direct_map.fillna(lower_map).fillna(df["indicator"])
+
+        rows = []
+        for _, row in df.iterrows():
+            canon = row["indicator_canon"]
+            expanded = EXPAND_MAP.get(canon)
+            if expanded:
+                for ind in expanded:
+                    r = row.copy()
+                    r["indicator"] = ind
+                    rows.append(r)
+            else:
+                row["indicator"] = canon
+                rows.append(row)
+        df = pd.DataFrame(rows).drop(columns=["indicator_canon"], errors="ignore")
+
+    df = (
+        df.groupby(["indicator", "road"], as_index=False)
+        .agg(SMAPE_ETS=("SMAPE_ETS", "min"))
+    )
+    return df[["indicator", "road", "SMAPE_ETS"]]
+
+
 # ============================================================
 # ОСНОВНАЯ ФУНКЦИЯ
 # ============================================================
 
 def build_smape_comparison(
-    ets_metrics_path: str | Path = "ets_results/ets_metrics_all_indicators.csv",
+    ets_metrics_path: str | Path = "ets_results/ets_metrics.csv",
     catboost_metrics_path: str | Path = "catboost_results/catboost_metrics.csv",
     detailed_out: str | Path = "compare_resuls/smape_comparison_detailed.csv",
     summary_out: str | Path = "compare_resuls/smape_comparison_by_indicator.csv",
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    split_out: str | Path = "compare_resuls/smape_comparison_split.csv",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Строит два CSV-отчёта сравнения ETS и CatBoost по SMAPE.
+    Строит три CSV-отчёта сравнения ETS и CatBoost по SMAPE.
 
-    Детальный отчёт — indicator × road:
-        indicator, indicator_name, road, SMAPE_ETS, SMAPE_CatBoost, Improvement_%
+    1. Детальный (агрегированный) — indicator × road, COUNT+SUM объединены:
+         indicator, indicator_name, road, SMAPE_ETS, SMAPE_CatBoost, Improvement_%
 
-    Сводный отчёт — по показателю:
-        indicator, indicator_name, roads_n,
-        SMAPE_ETS_mean, SMAPE_CatBoost_mean, Improvement_%
+    2. Сводный — по показателю (среднее по дорогам):
+         indicator, indicator_name, roads_n,
+         SMAPE_ETS_mean, SMAPE_CatBoost_mean, Improvement_%
+
+    3. Детальный с разбивкой COUNT/SUM — indicator × road, COUNT и SUM раздельно:
+         indicator, indicator_name, road, SMAPE_ETS, SMAPE_CatBoost, Improvement_%
+         Позволяет видеть, где модель точнее по количеству отказов,
+         а где — по потерям поездо-часов.
 
     Improvement_% > 0 → CatBoost точнее (меньше SMAPE).
 
@@ -265,8 +388,9 @@ def build_smape_comparison(
     ----------
     ets_metrics_path      : путь к CSV с метриками ETS
     catboost_metrics_path : путь к CSV с метриками CatBoost
-    detailed_out          : путь для детального отчёта
+    detailed_out          : путь для детального агрегированного отчёта
     summary_out           : путь для сводного отчёта
+    split_out             : путь для детального отчёта с разбивкой COUNT/SUM
     """
     ets_path = Path(ets_metrics_path)
     cb_path  = Path(catboost_metrics_path)
@@ -306,14 +430,45 @@ def build_smape_comparison(
         .reset_index(drop=True)
     )
 
-    # ── Сводный отчёт по показателю ──────────────────────────
+    # ── Отчёт с разбивкой COUNT/SUM + производные показатели ────
+    # Читаем сначала split-данные, чтобы на их основе строить сводный отчёт
+    ets_split = _read_ets_split(ets_path)
+    cb_split  = _read_catboost_split(cb_path)
+
+    split = ets_split.merge(cb_split, on=["indicator", "road"], how="inner")
+
+    split["Improvement_%"] = (
+        (split["SMAPE_ETS"] - split["SMAPE_CatBoost"])
+        / split["SMAPE_ETS"].replace(0, float("nan"))
+        * 100.0
+    ).round(2)
+
+    split["SMAPE_ETS"]      = split["SMAPE_ETS"].round(4)
+    split["SMAPE_CatBoost"] = split["SMAPE_CatBoost"].round(4)
+
+    split.insert(
+        1, "indicator_name",
+        split["indicator"].map(CB_INDICATOR_FULL_NAMES).fillna(split["indicator"])
+    )
+
+    indicator_rank_split = {k: i for i, k in enumerate(INDICATOR_ORDER_SPLIT)}
+    split["_rank"] = split["indicator"].map(indicator_rank_split).fillna(99)
+    split = (
+        split.sort_values(["_rank", "road"])
+        .drop(columns="_rank")
+        .reset_index(drop=True)
+    )
+
+    # ── Сводный отчёт: COUNT/SUM разбивка + производные показатели ──────────
+    # Строится из split-данных, чтобы отражать отдельные строки для
+    # LOSS_12_COUNT, LOSS_12_SUM, …, LOSS_COUNT_TOTAL, LOSS_SUM_TOTAL, SPECIFIC_LOSS.
     summary = (
-        detailed
+        split
         .groupby(["indicator", "indicator_name"], as_index=False)
         .agg(
-            roads_n          =("road",           "count"),
-            SMAPE_ETS_mean   =("SMAPE_ETS",      "mean"),
-            SMAPE_CatBoost_mean=("SMAPE_CatBoost","mean"),
+            roads_n             =("road",           "count"),
+            SMAPE_ETS_mean      =("SMAPE_ETS",      "mean"),
+            SMAPE_CatBoost_mean =("SMAPE_CatBoost", "mean"),
         )
     )
 
@@ -326,7 +481,7 @@ def build_smape_comparison(
     summary["SMAPE_ETS_mean"]      = summary["SMAPE_ETS_mean"].round(4)
     summary["SMAPE_CatBoost_mean"] = summary["SMAPE_CatBoost_mean"].round(4)
 
-    summary["_rank"] = summary["indicator"].map(indicator_rank).fillna(99)
+    summary["_rank"] = summary["indicator"].map(indicator_rank_split).fillna(99)
     summary = (
         summary.sort_values("_rank")
         .drop(columns="_rank")
@@ -334,19 +489,24 @@ def build_smape_comparison(
     )
 
     # ── Сохранение ────────────────────────────────────────────
-    for df, path in [(detailed, Path(detailed_out)), (summary, Path(summary_out))]:
+    for df, path in [
+        (detailed, Path(detailed_out)),
+        (summary,  Path(summary_out)),
+        (split,    Path(split_out)),
+    ]:
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(path, index=False, encoding="utf-8-sig")
 
     # ── Печать итогов ─────────────────────────────────────────
     print("[OK] Сравнение SMAPE (ETS vs CatBoost) завершено")
-    print(f"   Детально:  {detailed_out}  ({len(detailed)} строк)")
-    print(f"   Сводно:    {summary_out}  ({len(summary)} показателей)")
+    print(f"   Агрегированно: {detailed_out}  ({len(detailed)} строк)")
+    print(f"   Сводно:        {summary_out}  ({len(summary)} показателей)")
+    print(f"   COUNT/SUM:     {split_out}  ({len(split)} строк)")
     print()
     print(summary[["indicator_name", "SMAPE_ETS_mean", "SMAPE_CatBoost_mean", "Improvement_%"]]
           .to_string(index=False))
 
-    return detailed, summary
+    return detailed, summary, split
 
 
 # ============================================================

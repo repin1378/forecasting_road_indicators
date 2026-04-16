@@ -1,0 +1,16 @@
+{
+  "params": {
+    "learning_rate": 0.2548244993256197,
+    "depth": 4,
+    "l2_leaf_reg": 6.866741526486801,
+    "iterations": 1998,
+    "random_strength": 3.9141766265260545,
+    "bagging_temperature": 1.3981018312917057
+  },
+  "meta": {
+    "method": "optuna",
+    "n_trials": 20,
+    "n_splits": 3,
+    "best_cv_rmse": 0.3386
+  }
+}

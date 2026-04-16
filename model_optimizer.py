@@ -62,6 +62,8 @@ from catboost_model import (
     TARGET_INDICATORS,
     _add_features,
     _feature_cols,
+    _compute_road_stats,
+    _normalize_target,
 )
 
 
@@ -98,6 +100,7 @@ def _build_train_data(
     lags: List[int],
     windows: List[int],
     test_year: Optional[int] = None,
+    road_norm: bool = True,
 ) -> tuple[pd.DataFrame, np.ndarray, List[str]]:
     """
     Строит матрицу признаков для обучения.
@@ -107,6 +110,10 @@ def _build_train_data(
     Данные сортируются по (YEAR, MONTH) — это важно для корректной
     работы TimeSeriesSplit на панельных данных: каждый fold содержит
     строки всех дорог за несколько последовательных периодов.
+
+    road_norm : если True (по умолчанию), применяется z-score нормализация
+                по дорогам: y_norm = (y - mean[road]) / std[road].
+                Должен совпадать с режимом run_catboost_forecast.
     """
     if test_year is None:
         test_year = int(monthly_df["YEAR"].max())
@@ -124,9 +131,15 @@ def _build_train_data(
         .reset_index(drop=True)
     )
 
-    X_train = train[feat_cols].copy()
-    y_train = train[target].values
+    X_train  = train[feat_cols].copy()
+    y_raw    = train[target].values
     cat_cols = [c for c in CAT_FEATURES if c in feat_cols]
+
+    if road_norm:
+        road_stats = _compute_road_stats(train, target)
+        y_train = _normalize_target(y_raw, train["ROAD_NAME"].values, road_stats)
+    else:
+        y_train = y_raw
 
     return X_train, y_train, cat_cols
 
@@ -151,7 +164,10 @@ def _cv_rmse(
     а не по отдельным строкам — иначе одна дорога могла бы попасть
     в train, а другая — в val для одного и того же месяца.
 
-    Возвращает среднее RMSE по фолдам.
+    y уже трансформирован (log1p) в _build_train_data — здесь работаем
+    только в том пространстве, которое пришло на вход.
+
+    Возвращает среднее RMSE по фолдам (в пространстве y).
     """
     # Уникальные периоды в порядке возрастания времени
     periods = X[["YEAR", "MONTH"]].drop_duplicates().sort_values(["YEAR", "MONTH"])
@@ -185,8 +201,9 @@ def _cv_rmse(
         cb_params = {
             **DEFAULT_CB_PARAMS,
             **params,
-            "random_seed": seed,
-            "verbose":     False,
+            "random_seed":         seed,
+            "verbose":             False,
+            "allow_writing_files": False,  # prevents catboost_info writes → no Windows file locking
         }
 
         model = CatBoostRegressor(**cb_params)
@@ -194,7 +211,8 @@ def _cv_rmse(
             warnings.simplefilter("ignore")
             model.fit(train_pool, eval_set=val_pool)
 
-        preds = np.maximum(model.predict(X_val), 0.0)
+        # RMSE в том же пространстве, что y (log или исходное — зависит от _build_train_data)
+        preds = model.predict(X_val)
         rmse  = float(np.sqrt(np.mean((y_val - preds) ** 2)))
         fold_scores.append(rmse)
 
@@ -586,6 +604,7 @@ def run_optimization(
     force_refit: bool = False,
     save_importance: bool = True,
     param_space: Optional[dict] = None,
+    road_norm: bool = True,
 ) -> dict:
     """
     Полный цикл оптимизации гиперпараметров для одного показателя.
@@ -616,6 +635,8 @@ def run_optimization(
                       Для method="grid"   — Dict[str, list]  (аналог GRID_PARAM_SPACE).
                       Для method="optuna" — Dict[str, dict]  (аналог OPTUNA_PARAM_SPACE).
                       None — использовать значения по умолчанию из модуля.
+    road_norm       : True (по умолчанию) — z-score нормализация y по дорогам при CV.
+                      Должен совпадать с режимом run_catboost_forecast.
 
     Возвращает
     ----------
@@ -633,9 +654,10 @@ def run_optimization(
             return cached
 
     # ── Строим обучающую выборку ───────────────────────────
-    print(f"\n[Оптимизация] Показатель: {target}  Метод: {method}")
+    print(f"\n[Оптимизация] Показатель: {target}  Метод: {method}"
+          f"  road_norm: {road_norm}")
     X_train, y_train, cat_cols = _build_train_data(
-        monthly_df, target, lags, windows, test_year
+        monthly_df, target, lags, windows, test_year, road_norm=road_norm
     )
     print(f"  Обучающих строк: {len(X_train)}  "
           f"Признаков: {X_train.shape[1]}  "
@@ -720,6 +742,7 @@ def run_optimization_all(
     outdir: str | Path = "catboost_results",
     force_refit: bool = False,
     param_space: Optional[dict] = None,
+    road_norm: bool = True,
 ) -> Dict[str, dict]:
     """
     Оптимизирует гиперпараметры для каждого показателя в targets.
@@ -730,12 +753,14 @@ def run_optimization_all(
 
     Параметры
     ----------
-    targets     : список показателей (по умолчанию все TARGET_INDICATORS).
-                  Можно передать подмножество для ускорения.
-    param_space : переопределение пространства поиска для всех показателей.
-                  Для method="grid"   — Dict[str, list].
-                  Для method="optuna" — Dict[str, dict].
-                  None — использовать GRID_PARAM_SPACE / OPTUNA_PARAM_SPACE.
+    targets   : список показателей (по умолчанию все TARGET_INDICATORS).
+                Можно передать подмножество для ускорения.
+    param_space: переопределение пространства поиска для всех показателей.
+                Для method="grid"   — Dict[str, list].
+                Для method="optuna" — Dict[str, dict].
+                None — использовать GRID_PARAM_SPACE / OPTUNA_PARAM_SPACE.
+    road_norm : True (по умолчанию) — z-score нормализация y по дорогам при CV.
+                Должен совпадать с режимом run_catboost_forecast.
 
     Возвращает
     ----------
@@ -760,6 +785,7 @@ def run_optimization_all(
             force_refit=force_refit,
             save_importance=True,
             param_space=param_space,
+            road_norm=road_norm,
         )
         all_best[target] = best
 
