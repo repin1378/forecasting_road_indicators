@@ -42,9 +42,9 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 # ==================================================
 RUN_GENERATION   = False   # Шаг 1:   генерация monthly_df (данные уже есть)
 RUN_OPTIMIZATION = False   # Шаг 1.5: оптимизация гиперпараметров CatBoost
-RUN_FORECAST     = True   # Шаг 2:   обучение CatBoost и прогноз
-RUN_ETS          = True    # Шаг 3:   обучение ETS и прогноз
-RUN_COMPARISON   = True    # Шаг 4:   сравнение ETS vs CatBoost по SMAPE
+RUN_FORECAST     = False   # Шаг 2:   обучение CatBoost и прогноз
+RUN_ETS          = False    # Шаг 3:   обучение ETS и прогноз
+RUN_COMPARISON   = False    # Шаг 4:   сравнение ETS vs CatBoost по SMAPE
 RUN_PLOTS        = True   # Шаг 5:   построение HTML-графиков CatBoost
 
 # Метод оптимизации: "grid" (полный перебор) или "optuna" (байесовский поиск)

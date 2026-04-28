@@ -83,7 +83,7 @@ def plot_predictions(
     road: str,
     outpath: "Path | str",
     *,
-    model_name: str = "CatBoost",
+    model_name: str = "Градиентного Бустинга",
     line_color: str = "#1E64C8",
     fill_color: str = "rgba(30, 100, 200, 0.13)",
 ) -> None:
