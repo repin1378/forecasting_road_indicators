@@ -24,8 +24,11 @@ try:
         LAGS,
         ROLLING_WINDOWS,
         TARGET_INDICATORS,
-        _add_features,
+        TARGET_MODEL_COLUMNS,
+        _build_features,
         _feature_cols,
+        _target_cross_cols,
+        add_ratio_targets,
         filter_by_date_range,
     )
 except ImportError:  # pragma: no cover
@@ -35,8 +38,11 @@ except ImportError:  # pragma: no cover
         LAGS,
         ROLLING_WINDOWS,
         TARGET_INDICATORS,
-        _add_features,
+        TARGET_MODEL_COLUMNS,
+        _build_features,
         _feature_cols,
+        _target_cross_cols,
+        add_ratio_targets,
         filter_by_date_range,
     )
 
@@ -84,15 +90,18 @@ def _build_train_data(
         monthly_df = filter_by_date_range(monthly_df, start=model_start, end=model_end)
     elif test_year is not None:
         monthly_df = monthly_df[monthly_df["YEAR"] < test_year].copy()
-    feat_cols = _feature_cols(lags, windows)
-    full = _add_features(monthly_df, target, lags, windows)
+    monthly_df = add_ratio_targets(monthly_df)
+    model_target = TARGET_MODEL_COLUMNS.get(target, target)
+    cross_cols = _target_cross_cols(target)
+    feat_cols = _feature_cols(lags, windows, cross_cols)
+    full = _build_features(monthly_df, model_target, lags, windows, cross_cols)
     train = (
-        full.dropna(subset=feat_cols + [target])
+        full.dropna(subset=feat_cols + [model_target])
         .sort_values(["YEAR", "MONTH"])
         .reset_index(drop=True)
     )
     X_train = train[feat_cols].fillna(0)
-    y_train = train[target].to_numpy(dtype=float)
+    y_train = train[model_target].to_numpy(dtype=float)
     cat_cols = [c for c in CAT_FEATURES if c in feat_cols]
     return X_train, y_train, cat_cols
 

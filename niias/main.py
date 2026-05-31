@@ -4,7 +4,7 @@ Steps:
 1. Load and normalize niias/examples/niias_data.xlsx.
 1.5. Optionally optimize CatBoost hyperparameters.
 2. Train CatBoost models and make a recursive forecast.
-3. Compare CatBoost SMAPE with a seasonal naive baseline.
+3. Compare CatBoost SMAPE with the external NIIAS forecast.
 4. Build interactive HTML plots.
 """
 
@@ -36,17 +36,18 @@ except ImportError:  # pragma: no cover - supports `python niias/main.py`
     from smape_comparison import build_smape_comparison
 
 
-RUN_OPTIMIZATION = True
-RUN_FORECAST = False
-RUN_COMPARISON = False
-RUN_PLOTS = False
+RUN_OPTIMIZATION = False
+RUN_FORECAST = True
+RUN_COMPARISON = True
+RUN_PLOTS = True
 
 OPTIMIZE_METHOD = "optuna"
-OPTIMIZE_N_TRIALS = 50
-OPTIMIZE_N_SPLITS = 3
+OPTIMIZE_N_TRIALS = 100
+OPTIMIZE_N_SPLITS = 4
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_XLSX = BASE_DIR / "examples" / "niias_data.xlsx"
+NIIAS_FORECAST_XLSX = BASE_DIR / "niias_results" / "niias_forecasts.xlsx"
 OUTDIR = BASE_DIR / "catboost_results"
 FORECAST_XLSX = OUTDIR / "catboost_forecasts.xlsx"
 PLOTS_DIR = OUTDIR / "plots"
@@ -102,6 +103,8 @@ def main() -> None:
             forecast_end=FORECAST_END,
             random_seed=SEED,
             catboost_params_per_target=best_params_per_target or None,
+            comparison_forecast_path=NIIAS_FORECAST_XLSX,
+            comparison_model_name="NIIAS",
         )
         print(f"[Step 2] Forecast ready: {len(forecast_df)} rows")
     else:
@@ -113,10 +116,11 @@ def main() -> None:
 
     if RUN_COMPARISON:
         build_smape_comparison(
-            baseline_metrics_path=OUTDIR / "seasonal_naive_metrics.xlsx",
+            baseline_metrics_path=OUTDIR / "niias_model_metrics.xlsx",
             catboost_metrics_path=OUTDIR / "catboost_metrics.xlsx",
             detailed_out=BASE_DIR / "compare_results" / "smape_comparison_detailed.xlsx",
             summary_out=BASE_DIR / "compare_results" / "smape_comparison_by_indicator.xlsx",
+            baseline_name="NIIAS",
         )
         print("[Step 3] SMAPE comparison complete")
 
@@ -127,6 +131,7 @@ def main() -> None:
                 forecast_df=forecast_df,
                 indicator=indicator,
                 outpath=PLOTS_DIR / f"{indicator}.html",
+                forecast_start=FORECAST_START,
             )
         print(f"[Step 4] Plots saved: {PLOTS_DIR}")
 
