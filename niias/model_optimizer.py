@@ -22,29 +22,39 @@ try:
         CAT_FEATURES,
         DEFAULT_CB_PARAMS,
         LAGS,
+        PCH_MODEL_RATIO,
+        PCH_MODEL_TYPES,
         ROLLING_WINDOWS,
         TARGET_INDICATORS,
-        TARGET_MODEL_COLUMNS,
         _build_features,
         _feature_cols,
+        _model_target_col,
+        _recursive_forecast,
+        _split_model_config,
         _target_cross_cols,
         add_ratio_targets,
         filter_by_date_range,
     )
+    from .metrics import smape_percent
 except ImportError:  # pragma: no cover
     from catboost_model import (
         CAT_FEATURES,
         DEFAULT_CB_PARAMS,
         LAGS,
+        PCH_MODEL_RATIO,
+        PCH_MODEL_TYPES,
         ROLLING_WINDOWS,
         TARGET_INDICATORS,
-        TARGET_MODEL_COLUMNS,
         _build_features,
         _feature_cols,
+        _model_target_col,
+        _recursive_forecast,
+        _split_model_config,
         _target_cross_cols,
         add_ratio_targets,
         filter_by_date_range,
     )
+    from metrics import smape_percent
 
 
 GRID_PARAM_SPACE: Dict[str, list] = {
@@ -63,6 +73,31 @@ OPTUNA_PARAM_SPACE: Dict[str, dict] = {
     "bagging_temperature": {"type": "float", "low": 0.0, "high": 2.0},
 }
 
+BACKTEST_HORIZON = 14
+LAG_CANDIDATES: List[List[int]] = [
+    [1, 2, 3, 6, 12],
+    [1, 2, 3, 6, 12, 24],
+    [1, 2, 3, 6, 12, 24, 36],
+    [1, 2, 3, 6, 12, 13, 24],
+    [1, 2, 3, 6, 12, 13, 24, 36],
+]
+ROLLING_WINDOW_CANDIDATES: List[List[int]] = [
+    [3, 6],
+    [3, 6, 12],
+    [2, 3, 6, 12],
+    [3, 4, 6, 12],
+]
+
+
+def _encode_int_list(values: List[int]) -> str:
+    return ",".join(str(int(v)) for v in values)
+
+
+def _decode_int_list(value: str | List[int]) -> List[int]:
+    if isinstance(value, list):
+        return sorted({int(v) for v in value})
+    return sorted({int(part) for part in str(value).split(",") if part})
+
 
 def _time_series_splits(n_periods: int, n_splits: int):
     """Yield expanding-window splits over ordered period positions."""
@@ -75,6 +110,37 @@ def _time_series_splits(n_periods: int, n_splits: int):
         if train_end <= 0 or val_start >= val_end:
             continue
         yield np.arange(0, train_end), np.arange(val_start, val_end)
+
+
+def _backtest_period_splits(
+    periods: pd.DataFrame,
+    n_splits: int,
+    max_lag: int,
+    horizon: int = BACKTEST_HORIZON,
+) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
+    """Build rolling-origin backtest folds with contiguous validation periods."""
+    periods = periods.sort_values(["YEAR", "MONTH"]).reset_index(drop=True)
+    n_periods = len(periods)
+    min_train_periods = max_lag + 1
+    if n_periods <= min_train_periods + 1:
+        return []
+
+    feasible_horizon = max(1, (n_periods - min_train_periods) // max(n_splits, 1))
+    horizon = min(horizon, feasible_horizon)
+    if horizon <= 0:
+        return []
+
+    splits: list[tuple[pd.DataFrame, pd.DataFrame]] = []
+    for split_idx in range(n_splits):
+        val_end = n_periods - 1 - (n_splits - 1 - split_idx) * horizon
+        val_start = val_end - horizon + 1
+        train_end = val_start - 1
+        if train_end + 1 < min_train_periods or val_start < 0 or val_start > val_end:
+            continue
+        train_periods = periods.iloc[: train_end + 1].copy()
+        val_periods = periods.iloc[val_start : val_end + 1].copy()
+        splits.append((train_periods, val_periods))
+    return splits
 
 
 def _build_train_data(
@@ -91,7 +157,7 @@ def _build_train_data(
     elif test_year is not None:
         monthly_df = monthly_df[monthly_df["YEAR"] < test_year].copy()
     monthly_df = add_ratio_targets(monthly_df)
-    model_target = TARGET_MODEL_COLUMNS.get(target, target)
+    model_target = _model_target_col(target)
     cross_cols = _target_cross_cols(target)
     feat_cols = _feature_cols(lags, windows, cross_cols)
     full = _build_features(monthly_df, model_target, lags, windows, cross_cols)
@@ -106,39 +172,134 @@ def _build_train_data(
     return X_train, y_train, cat_cols
 
 
-def _cv_rmse(params: dict, X: pd.DataFrame, y: np.ndarray, cat_cols: List[str], n_splits: int, seed: int, trial=None) -> float:
+def _backtest_smape(
+    params: dict,
+    monthly_df: pd.DataFrame,
+    target: str,
+    lags: List[int],
+    windows: List[int],
+    n_splits: int,
+    seed: int,
+    trial=None,
+    horizon: int = BACKTEST_HORIZON,
+) -> float:
     if CatBoostRegressor is None or Pool is None:
         raise ImportError(
             "CatBoost is required for optimization. Install it in the Python environment: "
             "pip install catboost"
         )
 
-    periods = X[["YEAR", "MONTH"]].drop_duplicates().sort_values(["YEAR", "MONTH"])
+    cb_params_only, trial_lags, trial_windows, pch_model_type = _split_model_config(
+        params,
+        lags,
+        windows,
+    )
+    df = add_ratio_targets(monthly_df).sort_values("DATE").reset_index(drop=True)
+    periods = df[["YEAR", "MONTH"]].drop_duplicates().sort_values(["YEAR", "MONTH"])
+    splits = _backtest_period_splits(periods, n_splits=n_splits, max_lag=max(trial_lags), horizon=horizon)
+    if not splits:
+        return float("inf")
+
+    model_target = _model_target_col(target, pch_model_type)
+    cross_cols = _target_cross_cols(target)
+    feat_cols = _feature_cols(trial_lags, trial_windows, cross_cols)
+    cat_cols = [c for c in CAT_FEATURES if c in feat_cols]
     scores: List[float] = []
 
-    for fold, (tr_period_pos, val_period_pos) in enumerate(_time_series_splits(len(periods), n_splits)):
-        tr_periods = periods.iloc[tr_period_pos]
-        val_periods = periods.iloc[val_period_pos]
-        period_index = X.set_index(["YEAR", "MONTH"]).index
-        tr_mask = period_index.isin(list(zip(tr_periods["YEAR"], tr_periods["MONTH"])))
-        val_mask = period_index.isin(list(zip(val_periods["YEAR"], val_periods["MONTH"])))
-        if tr_mask.sum() == 0 or val_mask.sum() == 0:
+    for fold, (train_periods, val_periods) in enumerate(splits):
+        train_keys = list(zip(train_periods["YEAR"], train_periods["MONTH"]))
+        val_keys = list(zip(val_periods["YEAR"], val_periods["MONTH"]))
+        train_df = df[df.set_index(["YEAR", "MONTH"]).index.isin(train_keys)].copy()
+        val_df = df[df.set_index(["YEAR", "MONTH"]).index.isin(val_keys)].copy()
+        if train_df.empty or val_df.empty:
+            continue
+
+        full_feat = _build_features(train_df, model_target, trial_lags, trial_windows, cross_cols)
+        train_feat = full_feat.dropna(subset=feat_cols + [model_target]).sort_values(["YEAR", "MONTH"])
+        if train_feat.empty:
             continue
 
         cb_params = {
             **DEFAULT_CB_PARAMS,
-            **params,
+            **cb_params_only,
             "random_seed": seed,
             "verbose": False,
             "allow_writing_files": False,
+            "use_best_model": False,
+            "early_stopping_rounds": None,
         }
+        ots_forecast_df = None
+        if target == "PCH_OTS":
+            ots_feat_cols = _feature_cols(trial_lags, trial_windows, [])
+            ots_full_feat = _build_features(train_df, "OTS", trial_lags, trial_windows, [])
+            ots_train_feat = ots_full_feat.dropna(subset=ots_feat_cols + ["OTS"]).sort_values(["YEAR", "MONTH"])
+            if ots_train_feat.empty:
+                continue
+            ots_model = CatBoostRegressor(**cb_params)
+            ots_model.fit(Pool(
+                ots_train_feat[ots_feat_cols].fillna(0),
+                ots_train_feat["OTS"].to_numpy(dtype=float),
+                cat_features=[c for c in CAT_FEATURES if c in ots_feat_cols],
+            ))
+            ots_forecast_df = _recursive_forecast(
+                model=ots_model,
+                history_df=train_df[["DATE", "YEAR", "MONTH", "OTS"]],
+                target_col="OTS",
+                future_dates=val_df[["DATE", "YEAR", "MONTH"]].sort_values("DATE").reset_index(drop=True),
+                lags=trial_lags,
+                windows=trial_windows,
+                feature_cols=ots_feat_cols,
+            )[["DATE", "OTS"]]
+
         model = CatBoostRegressor(**cb_params)
-        model.fit(
-            Pool(X[tr_mask], y[tr_mask], cat_features=cat_cols),
-            eval_set=Pool(X[val_mask], y[val_mask], cat_features=cat_cols),
+
+        X_train = train_feat[feat_cols].fillna(0)
+        y_train = train_feat[model_target].to_numpy(dtype=float)
+        model.fit(Pool(X_train, y_train, cat_features=cat_cols))
+
+        future_dates = val_df[["DATE", "YEAR", "MONTH"]].sort_values("DATE").reset_index(drop=True)
+        cross_future_df = None
+        if cross_cols:
+            if target == "PCH_OTS" and ots_forecast_df is not None and "OTS" in cross_cols:
+                cross_future_df = ots_forecast_df.copy()
+            else:
+                cross_future_df = val_df[["DATE", *cross_cols]].copy()
+
+        pred_model = _recursive_forecast(
+            model=model,
+            history_df=train_df[["DATE", "YEAR", "MONTH", model_target] + cross_cols],
+            target_col=model_target,
+            future_dates=future_dates,
+            lags=trial_lags,
+            windows=trial_windows,
+            feature_cols=feat_cols,
+            cross_cols=cross_cols,
+            cross_future_df=cross_future_df,
         )
-        pred = model.predict(X[val_mask])
-        scores.append(float(np.sqrt(np.mean((y[val_mask] - pred) ** 2))))
+
+        if target == "PCH_OTS" and pch_model_type == PCH_MODEL_RATIO:
+            pred_df = pred_model[["DATE", model_target]].merge(
+                ots_forecast_df.rename(columns={"OTS": "OTS_pred"}),
+                on="DATE",
+                how="left",
+            ).merge(
+                val_df[["DATE", target]], on="DATE", how="left"
+            )
+            y_pred = (pred_df[model_target] * pred_df["OTS_pred"]).to_numpy(dtype=float)
+            y_true = pred_df[target].to_numpy(dtype=float)
+        else:
+            pred_df = pred_model[["DATE", model_target]].rename(
+                columns={model_target: f"{target}_pred"}
+            ).merge(
+                val_df[["DATE", target]].rename(columns={target: f"{target}_actual"}),
+                on="DATE",
+                how="left",
+            )
+            y_pred = pred_df[f"{target}_pred"].to_numpy(dtype=float)
+            y_true = pred_df[f"{target}_actual"].to_numpy(dtype=float)
+
+        score = smape_percent(y_true, y_pred)
+        scores.append(score)
 
         if trial is not None:
             import optuna
@@ -150,9 +311,10 @@ def _cv_rmse(params: dict, X: pd.DataFrame, y: np.ndarray, cat_cols: List[str], 
 
 
 def optimize_model_parameters_grid(
-    X_train: pd.DataFrame,
-    y_train: np.ndarray,
-    cat_cols: List[str],
+    monthly_df: pd.DataFrame,
+    target: str,
+    lags: List[int],
+    windows: List[int],
     param_space: Optional[Dict[str, list]] = None,
     n_splits: int = 3,
     seed: int = 42,
@@ -163,18 +325,19 @@ def optimize_model_parameters_grid(
     keys = list(param_space.keys())
     for combo in product(*param_space.values()):
         params = dict(zip(keys, combo))
-        score = _cv_rmse(params, X_train, y_train, cat_cols, n_splits, seed)
+        score = _backtest_smape(params, monthly_df, target, lags, windows, n_splits, seed)
         if score < best_score:
             best_score = score
             best_params = params.copy()
-        print(f"  grid RMSE={score:.4f} best={best_score:.4f} params={params}")
+        print(f"  grid SMAPE={score:.4f} best={best_score:.4f} params={params}")
     return best_params
 
 
 def optimize_model_parameters_optuna(
-    X_train: pd.DataFrame,
-    y_train: np.ndarray,
-    cat_cols: List[str],
+    monthly_df: pd.DataFrame,
+    target: str,
+    lags: List[int],
+    windows: List[int],
     param_space: Optional[Dict[str, dict]] = None,
     n_splits: int = 3,
     n_trials: int = 20,
@@ -195,11 +358,28 @@ def optimize_model_parameters_optuna(
                 params[name] = trial.suggest_int(name, cfg["low"], cfg["high"])
             else:
                 raise ValueError(f"Unsupported param type: {cfg['type']}")
-        return _cv_rmse(params, X_train, y_train, cat_cols, n_splits, seed, trial=trial)
+        params["lags"] = _decode_int_list(trial.suggest_categorical(
+            "lags",
+            [_encode_int_list(v) for v in LAG_CANDIDATES],
+        ))
+        params["rolling_windows"] = _decode_int_list(trial.suggest_categorical(
+            "rolling_windows",
+            [_encode_int_list(v) for v in ROLLING_WINDOW_CANDIDATES],
+        ))
+        if target == "PCH_OTS":
+            params["pch_model_type"] = trial.suggest_categorical("pch_model_type", PCH_MODEL_TYPES)
+        return _backtest_smape(params, monthly_df, target, lags, windows, n_splits, seed, trial=trial)
 
     study = optuna.create_study(direction="minimize", sampler=TPESampler(seed=seed), pruner=MedianPruner())
     study.optimize(objective, n_trials=n_trials)
-    return dict(study.best_params), study
+    best_params = dict(study.best_params)
+    if "lags" in best_params:
+        best_params["lags"] = _decode_int_list(best_params["lags"])
+    if "rolling_windows" in best_params:
+        best_params["rolling_windows"] = _decode_int_list(best_params["rolling_windows"])
+    if target != "PCH_OTS":
+        best_params.pop("pch_model_type", None)
+    return best_params, study
 
 
 def save_best_params(params: dict, outdir: str | Path, target: str, meta: Optional[dict] = None) -> Path:
@@ -253,24 +433,66 @@ def run_optimization(
 
     lags = lags or LAGS
     windows = rolling_windows or ROLLING_WINDOWS
+    optimization_df = monthly_df.copy()
+    if model_start is not None or model_end is not None:
+        optimization_df = filter_by_date_range(optimization_df, start=model_start, end=model_end)
+    elif test_year is not None:
+        optimization_df = optimization_df[optimization_df["YEAR"] < test_year].copy()
+    optimization_df = add_ratio_targets(optimization_df)
+
     X_train, y_train, cat_cols = _build_train_data(
-        monthly_df, target, lags, windows, test_year, model_start=model_start, model_end=model_end
+        optimization_df, target, lags, windows
     )
-    print(f"[Optimization] {target}: rows={len(X_train)} features={X_train.shape[1]} method={method}")
+    print(
+        f"[Optimization] {target}: rows={len(X_train)} features={X_train.shape[1]} "
+        f"method={method} objective=backtest_SMAPE"
+    )
     started = time.time()
 
     if method == "grid":
-        best_params = optimize_model_parameters_grid(X_train, y_train, cat_cols, param_space, n_splits, seed)
-        meta = {"method": "grid", "n_splits": n_splits}
+        best_params = optimize_model_parameters_grid(
+            monthly_df=optimization_df,
+            target=target,
+            lags=lags,
+            windows=windows,
+            param_space=param_space,
+            n_splits=n_splits,
+            seed=seed,
+        )
+        best_score = _backtest_smape(best_params, optimization_df, target, lags, windows, n_splits, seed)
+        meta = {
+            "method": "grid",
+            "objective": "backtest_SMAPE",
+            "n_splits": n_splits,
+            "backtest_horizon": BACKTEST_HORIZON,
+            "optimized_features": False,
+            "lags": lags,
+            "rolling_windows": windows,
+            "pch_model_type": best_params.get("pch_model_type", PCH_MODEL_RATIO) if target == "PCH_OTS" else None,
+            "best_backtest_smape": round(float(best_score), 4),
+        }
     elif method == "optuna":
         best_params, study = optimize_model_parameters_optuna(
-            X_train, y_train, cat_cols, param_space, n_splits, n_trials, seed
+            monthly_df=optimization_df,
+            target=target,
+            lags=lags,
+            windows=windows,
+            param_space=param_space,
+            n_splits=n_splits,
+            n_trials=n_trials,
+            seed=seed,
         )
         meta = {
             "method": "optuna",
+            "objective": "backtest_SMAPE",
             "n_trials": len(study.trials),
             "n_splits": n_splits,
-            "best_cv_rmse": round(float(study.best_value), 4),
+            "backtest_horizon": BACKTEST_HORIZON,
+            "optimized_features": True,
+            "lags": best_params.get("lags", lags),
+            "rolling_windows": best_params.get("rolling_windows", windows),
+            "pch_model_type": best_params.get("pch_model_type", PCH_MODEL_RATIO) if target == "PCH_OTS" else None,
+            "best_backtest_smape": round(float(study.best_value), 4),
         }
     else:
         raise ValueError("method must be 'grid' or 'optuna'")

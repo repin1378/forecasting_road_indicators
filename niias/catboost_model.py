@@ -39,6 +39,9 @@ RAW_TARGET_MAP: Dict[str, str] = {
 TARGET_INDICATORS: List[str] = list(RAW_TARGET_MAP.values())
 INTEGER_TARGETS: List[str] = ["OTS"]
 RATIO_TARGET = "PCH_PER_OTS"
+PCH_MODEL_DIRECT = "direct"
+PCH_MODEL_RATIO = "ratio"
+PCH_MODEL_TYPES: List[str] = [PCH_MODEL_RATIO, PCH_MODEL_DIRECT]
 TARGET_MODEL_COLUMNS: Dict[str, str] = {
     "OTS": "OTS",
     "PCH_OTS": RATIO_TARGET,
@@ -179,6 +182,31 @@ def _add_features(df: pd.DataFrame, target_col: str, lags: List[int], windows: L
 
 def _target_cross_cols(target: str) -> List[str]:
     return CROSS_FEATURES_BY_TARGET.get(target, [])
+
+
+def _model_target_col(target: str, pch_model_type: str = PCH_MODEL_RATIO) -> str:
+    if target == "PCH_OTS" and pch_model_type == PCH_MODEL_DIRECT:
+        return "PCH_OTS"
+    return TARGET_MODEL_COLUMNS.get(target, target)
+
+
+def _split_model_config(
+    params: Optional[dict],
+    default_lags: List[int],
+    default_windows: List[int],
+) -> tuple[dict, List[int], List[int], str]:
+    params = dict(params or {})
+    pch_model_type = params.pop("pch_model_type", PCH_MODEL_RATIO)
+    if pch_model_type not in PCH_MODEL_TYPES:
+        raise ValueError(f"Unsupported pch_model_type={pch_model_type!r}. Use one of {PCH_MODEL_TYPES}")
+
+    target_lags = params.pop("lags", default_lags)
+    target_windows = params.pop("rolling_windows", default_windows)
+    target_lags = sorted({int(v) for v in target_lags})
+    target_windows = sorted({int(v) for v in target_windows})
+    if not target_lags or not target_windows:
+        raise ValueError("Model config must include at least one lag and one rolling window")
+    return params, target_lags, target_windows, pch_model_type
 
 
 def _add_cross_features(
@@ -441,15 +469,29 @@ def run_catboost_forecast(
         base_params.update(catboost_params)
 
     for target in TARGET_INDICATORS:
-        model_target = TARGET_MODEL_COLUMNS.get(target, target)
-        cross_cols = _target_cross_cols(target)
-        feature_cols = _feature_cols(lags, rolling_windows, cross_cols)
         params = base_params.copy()
         if catboost_params_per_target and target in catboost_params_per_target:
-            params.update(catboost_params_per_target[target])
+            target_params, target_lags, target_windows, pch_model_type = _split_model_config(
+                catboost_params_per_target[target],
+                lags,
+                rolling_windows,
+            )
+            params.update(target_params)
+        else:
+            target_lags = lags
+            target_windows = rolling_windows
+            pch_model_type = PCH_MODEL_RATIO
 
-        print(f"  [{target}] training CatBoost...")
-        full_feat = _build_features(train_df, model_target, lags, rolling_windows, cross_cols)
+        model_target = _model_target_col(target, pch_model_type)
+        cross_cols = _target_cross_cols(target)
+        feature_cols = _feature_cols(target_lags, target_windows, cross_cols)
+
+        print(
+            f"  [{target}] training CatBoost..."
+            f" lags={target_lags} windows={target_windows}"
+            f"{f' pch_model_type={pch_model_type}' if target == 'PCH_OTS' else ''}"
+        )
+        full_feat = _build_features(train_df, model_target, target_lags, target_windows, cross_cols)
         train_feat = full_feat.dropna(subset=feature_cols + [model_target])
         actual_on_forecast = requested_future_dates[["DATE"]].merge(
             actual_df[["DATE", target]], on="DATE", how="left"
@@ -474,13 +516,13 @@ def run_catboost_forecast(
             history_df=train_df[["DATE", "YEAR", "MONTH", model_target] + cross_cols],
             target_col=model_target,
             future_dates=future_dates,
-            lags=lags,
-            windows=rolling_windows,
+            lags=target_lags,
+            windows=target_windows,
             feature_cols=feature_cols,
             cross_cols=cross_cols,
             cross_future_df=forecast_parts[0].join(pd.concat(forecast_parts[1:], axis=1)) if cross_cols and len(forecast_parts) > 1 else None,
         )[["DATE", "YEAR", "MONTH", model_target]]
-        if target == "PCH_OTS":
+        if target == "PCH_OTS" and pch_model_type == PCH_MODEL_RATIO:
             ots_forecast = forecast_parts[0].join(pd.concat(forecast_parts[1:], axis=1))[["DATE", "OTS"]]
             forecast_target_all = forecast_target_all.merge(ots_forecast, on="DATE", how="left")
             forecast_target_all[target] = forecast_target_all[model_target] * forecast_target_all["OTS"]
